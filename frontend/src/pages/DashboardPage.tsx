@@ -279,10 +279,13 @@ export function DashboardPage() {
                     <code className="text-sm font-mono text-heading">{doc.correlativo}</code>
                   </td>
                   <td className="px-4 py-3">
-                    <span className="badge badge-gray">{doc.tipo_documento}</span>
+                    <span className="badge badge-gray">{doc.tipo_doc_codigo || doc.tipo_documento}</span>
                   </td>
                   <td className="px-4 py-3 text-sm text-muted">
-                    {doc.oficina_origen} → {doc.oficina_destino}
+                    <div className="flex items-center gap-1">
+                      <Building2 className="w-3 h-3" />
+                      <span>{doc.oficina_origen_sigla || doc.oficina_origen} → {doc.oficina_destino_sigla || doc.oficina_destino}</span>
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-sm text-muted">
                     {doc.fecha_documento ? (() => { const [y,m,d] = doc.fecha_documento.split('-').map(Number); return format(new Date(y, m-1, d), 'dd/MM/yyyy', { locale: es }) })() : '-'}
