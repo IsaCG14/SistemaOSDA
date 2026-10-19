@@ -1,0 +1,506 @@
+# docker-compose.yml
+# Office Secretary Document Agent - Infraestructura base
+# Perfiles: docker compose --profile prod up -d
+#           docker compose --profile dev up -d
+
+version: "3.9"
+
+services:
+  # ─────────────────────────────────────────────────────────────────
+  # REVERSE PROXY & SSL (Caddy - auto HTTPS con Let's Encrypt o self-signed)
+  # ─────────────────────────────────────────────────────────────────
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: osda-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile:ro
+      - /media/openclaw/9be737b2-9408-4d79-b12f-44e47fa38b29/osda_data/project_data/caddy_data:/data
+      - /media/openclaw/9be737b2-9408-4d79-b12f-44e47fa38b29/osda_data/project_data/caddy_config:/config
+    networks:
+      - osda-frontend
+      - osda-backend
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    profiles: ["prod", "dev"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # SUPABASE SELF-HOSTED (PostgreSQL + Auth + Storage + Studio + Kong)
+  # ─────────────────────────────────────────────────────────────────
+  supabase-db:
+    image: postgres:15-alpine
+    container_name: osda-supabase-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: ${SUPABASE_DB_PASSWORD}
+    command: >
+      postgres
+      -c wal_level=logical
+      -c archive_mode=on
+      -c archive_command='test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f'
+      -c max_wal_senders=4
+      -c wal_keep_size=1GB
+      -c synchronous_commit=on
+      -c fsync=on
+      -c full_page_writes=on
+      -c shared_buffers=2GB
+      -c effective_cache_size=6GB
+      -c maintenance_work_mem=512MB
+      -c work_mem=32MB
+      -c max_connections=200
+    volumes:
+      - /media/openclaw/9be737b2-9408-4d79-b12f-44e47fa38b29/osda_data/project_data/postgres:/var/lib/postgresql/data
+      - /media/openclaw/9be737b2-9408-4d79-b12f-44e47fa38b29/osda_data/project_data/wal:/var/lib/postgresql/archive
+    networks:
+      - osda-backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    profiles: ["prod", "dev"]
+
+  supabase-kong:
+    image: kong:3.5
+    container_name: osda-supabase-kong
+    restart: unless-stopped
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_DNS_ORDER: "LAST,A,CNAME"
+      KONG_PLUGINS: "request-transformer,response-transformer,cors,key-auth,acl,rate-limiting"
+    volumes:
+      - ./supabase/kong.yml:/kong/kong.yml:ro
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - osda-backend
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles: ["prod", "dev"]
+
+  supabase-auth:
+    image: supabase/gotrue:v2.165.0
+    container_name: osda-supabase-auth
+    restart: unless-stopped
+    environment:
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://postgres:changeme_secure_password_min_32_chars@supabase-db:5432/postgres?search_path=auth
+      GOTRUE_SITE_URL: ${SITE_URL:-http://localhost}
+      GOTRUE_URI_ALLOW_LIST: ${SITE_URL:-http://localhost}
+      GOTRUE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_DISABLE_SIGNUP: "false"
+      API_EXTERNAL_URL: ${SITE_URL:-http://localhost}
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - osda-backend
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9999/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles: ["prod", "dev"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # STORAGE - Using simple file storage instead of Supabase Storage API
+  # ─────────────────────────────────────────────────────────────────
+  # Note: supabase/storage-api image not available on Docker Hub
+  # Using local filesystem with imgproxy for transformations
+  # For production, consider using MinIO or S3-compatible storage
+  storage-proxy:
+    image: darthsim/imgproxy:v3.9.0
+    container_name: osda-storage-proxy
+    restart: unless-stopped
+    environment:
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /storage
+      IMGPROXY_USE_WATERMARK: "false"
+    volumes:
+      - /media/openclaw/9be737b2-9408-4d79-b12f-44e47fa38b29/osda_data/project_data/storage:/storage
+    networks:
+      - osda-backend
+    ports:
+      - "5001:5001"
+    profiles: ["prod", "dev"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # SUPABASE STUDIO - Using PostgREST + custom dashboard instead
+  # ─────────────────────────────────────────────────────────────────
+  # Note: supabase/studio image not available on Docker Hub
+  # We'll use our own React dashboard (frontend service)
+  # For database admin, use pgAdmin or connect directly
+
+  supabase-meta:
+    image: supabase/postgres-meta:v0.83.0
+    container_name: osda-supabase-meta
+    restart: unless-stopped
+    environment:
+      PG_META_PORT: 8080
+      PG_META_DB_HOST: supabase-db
+      PG_META_DB_PORT: 5432
+      PG_META_DB_NAME: postgres
+      PG_META_DB_USER: postgres
+      PG_META_DB_PASSWORD: ${SUPABASE_DB_PASSWORD}
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - osda-backend
+    profiles: ["prod", "dev"]
+
+  supabase-realtime:
+    image: supabase/realtime:v2.33.8
+    container_name: osda-supabase-realtime
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      PORT: 4000
+      DB_HOST: supabase-db
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: ${SUPABASE_DB_PASSWORD}
+      DB_NAME: postgres
+      DB_AFTER_CONNECT_QUERY: "SET search_path TO _realtime"
+      SECURE_CHANNELS: "true"
+      ENABLE_TAILSCALE: "false"
+      SECRET_KEY_BASE: ${SUPABASE_JWT_SECRET}
+      APP_NAME: realtime
+      RLIMIT_NOFILE: "1048576"
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - osda-backend
+    profiles: ["prod", "dev"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # GRAPHIFY - Motor de grafos para consultas documentales
+  # Using Neo4j with Graphify extensions or simple graph layer
+  # ─────────────────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: osda-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-graphify_password}
+      NEO4J_dbms_memory_heap_initial__size: 1G
+      NEO4J_dbms_memory_heap_max__size: 2G
+      NEO4J_dbms_memory_pagecache_size: 1G
+    volumes:
+      - /media/openclaw/9be737b2-9408-4d79-b12f-44e47fa38b29/osda_data/project_data/neo4j:/data
+      - /media/openclaw/9be737b2-9408-4d79-b12f-44e47fa38b29/osda_data/project_data/neo4j_logs:/logs
+      - /media/openclaw/9be737b2-9408-4d79-b12f-44e47fa38b29/osda_data/project_data/neo4j_import:/var/lib/neo4j/import
+    networks:
+      - osda-backend
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "wget -q --spider http://localhost:7474 && timeout 1 bash -c 'cat < /dev/null > /dev/tcp/localhost/7687'"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    profiles: ["prod", "dev"]
+
+  # Graphify API layer (custom service to connect Neo4j with our data model)
+  graphify:
+    build:
+      context: ./graphify
+      dockerfile: Dockerfile
+      target: production
+    container_name: osda-graphify
+    restart: unless-stopped
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-graphify_password}
+      - GRAPHIFY_INDEX_NAME=${GRAPHIFY_INDEX_NAME:-osda_docs}
+      - GRAPHIFY_EMBEDDING_MODEL=${GRAPHIFY_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      - GRAPHIFY_EMBEDDING_DIM=384
+      - GRAPHIFY_API_PORT=8080
+      - LOG_LEVEL=DEBUG
+    volumes:
+      - ./graphify:/app:ro
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    networks:
+      - osda-backend
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    profiles: ["prod", "dev"]
+
+  # PostgREST - REST API for PostgreSQL
+  postgrest:
+    image: postgrest/postgrest:v14.12
+    container_name: osda-postgrest
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: postgres://postgres:${SUPABASE_DB_PASSWORD}@supabase-db:5432/postgres
+      PGRST_DB_SCHEMA: public
+      PGRST_DB_ANON_ROLE: postgres
+      PGRST_SERVER_PORT: 3000
+      PGRST_OPENAPI_SERVER_PROXY_URI: http://localhost:3000
+      PGRST_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - osda-backend
+    ports:
+      - "3000:3000"
+    profiles: ["prod", "dev"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # OLLAMA - LLM local para Vision (CPU-only) y embeddings
+  # ─────────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: osda-ollama
+    restart: unless-stopped
+    environment:
+      OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_MODELS: /models
+      OLLAMA_NUM_PARALLEL: 1
+      OLLAMA_MAX_LOADED_MODELS: 1
+      OLLAMA_FLASH_ATTENTION: "false"
+    volumes:
+      - /media/openclaw/9be737b2-9408-4d79-b12f-44e47fa38b29/osda_data/project_data/ollama:/models
+    networks:
+      - osda-backend
+    ports:
+      - "11434:11434"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    deploy:
+      resources:
+        limits:
+          cpus: '3'
+          memory: 12G
+        reservations:
+          cpus: '2'
+          memory: 8G
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s
+    profiles: ["prod", "dev"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # BACKEND FASTAPI - API interna + Webhooks Telegram
+  # ─────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: osda-backend
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=production
+      - SUPABASE_URL=http://supabase-kong:8000
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_JWT_SECRET=${SUPABASE_JWT_SECRET}
+      - GRAPHIFY_URL=http://graphify:8080
+      - GRAPHIFY_INDEX_NAME=${GRAPHIFY_INDEX_NAME:-osda_docs}
+      - OLLAMA_URL=http://ollama:11434
+      - VISION_PROVIDER=${VISION_PROVIDER:-ollama}
+      - VISION_MODEL=${VISION_MODEL}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_CHAT_IDS=${TELEGRAM_ALLOWED_CHAT_IDS}
+      - APP_SECRET_KEY=${APP_SECRET_KEY}
+      - MAX_UPLOAD_SIZE_MB=${MAX_UPLOAD_SIZE_MB:-10}
+      - ALLOWED_MIME_TYPES=${ALLOWED_MIME_TYPES:-image/jpeg,image/png,application/pdf}
+      - LOG_LEVEL=DEBUG
+      - LOG_FORMAT=json
+      - HTTPS_PROXY=${HTTP_PROXY:-}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.0/8,::1,backend,ollama,postgres,supabase-kong,supabase-*,graphify,neo4j,192.168.0.0/16,172.16.0.0/12,osda-backend,supabase-kong
+    volumes:
+      - ./backend/app:/app/app:ro
+    depends_on:
+      supabase-kong:
+        condition: service_healthy
+      graphify:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    networks:
+      - osda-backend
+      - osda-frontend
+    profiles: ["prod", "dev"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # TELEGRAM BOT - Worker separado para long-polling/webhook
+  # ─────────────────────────────────────────────────────────────────
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
+      target: production
+    container_name: osda-telegram-bot
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=production
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_CHAT_IDS=${TELEGRAM_ALLOWED_CHAT_IDS}
+      - BACKEND_URL=http://backend:8000
+      - OLLAMA_URL=http://ollama:11434
+      - VISION_MODEL=${VISION_MODEL}
+      - LOG_LEVEL=DEBUG
+      - LOG_FORMAT=json
+      - HTTPS_PROXY=${HTTP_PROXY:-}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.0/8,::1,backend,ollama,postgres,supabase-kong,supabase-*,graphify,neo4j,192.168.0.0/16,172.16.0.0/12,osda-backend,supabase-kong
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+    volumes:
+      - ./bot/core:/app/core:ro
+      - ./bot/handlers:/app/handlers:ro
+      - ./bot/middlewares:/app/middlewares:ro
+      - ./bot/vision:/app/vision:ro
+      - ./bot/main.py:/app/main.py:ro
+      - ./bot/__init__.py:/app/__init__.py:ro
+      - ./bot/requirements.txt:/app/requirements.txt:ro
+      - ./bot/entrypoint.sh:/entrypoint.sh:ro
+    depends_on:
+      backend:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    networks:
+      - osda-backend
+    profiles: ["prod", "dev"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # FRONTEND - React + Vite + Tailwind (servido por Caddy en prod)
+  # ─────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production
+    container_name: osda-frontend
+    restart: unless-stopped
+    environment:
+      - VITE_API_URL=http://localhost/api
+      - VITE_WS_URL=ws://localhost/ws
+    networks:
+      - osda-frontend
+      - osda-backend
+    profiles: ["prod", "dev"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # BACKUP DIARIO - pg_dump + volumes (Deshabilitado - usa bind mounts)
+  # ─────────────────────────────────────────────────────────────────
+  #  backup:
+  #    image: postgres:16-alpine
+  #    container_name: osda-backup
+  #    restart: "no"
+  #    environment:
+  #      PGPASSWORD: ${SUPABASE_DB_PASSWORD}
+  #    volumes:
+  #      - supabase_db_data:/var/lib/postgresql/data:ro
+  #      - ./backups:/backups
+  #      - ./scripts/backup.sh:/backup.sh:ro
+  #    entrypoint: ["bash", "/backup.sh"]
+  #    depends_on:
+  #      supabase-db:
+  #        condition: service_healthy
+  #    networks:
+  #      - osda-backend
+  #    profiles: ["prod"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # MIGRACIONES - Ejecutadas una vez al deploy
+  # ─────────────────────────────────────────────────────────────────
+  migrator:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: migrator
+    container_name: osda-migrator
+    restart: "no"
+    environment:
+      - SUPABASE_URL=http://supabase-kong:8000
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - DATABASE_URL=postgresql://postgres:changeme_secure_password_min_32_chars@supabase-db:5432/postgres
+    volumes:
+      - ./backend/alembic:/alembic:ro
+      - ./backend/alembic.ini:/alembic.ini:ro
+    depends_on:
+      supabase-db:
+        condition: service_healthy
+    networks:
+      - osda-backend
+    profiles: ["prod", "dev"]
+
+# ─────────────────────────────────────────────────────────────────
+# VOLÚMENES PERSISTENTES (Comentados - usando bind mounts en sdb1)
+# ─────────────────────────────────────────────────────────────────
+# volumes:
+#   supabase_db_data:
+#     driver: local
+#   supabase_wal_archive:
+#     driver: local
+#   supabase_storage_data:
+#     driver: local
+#   neo4j_data:
+#     driver: local
+#   neo4j_logs:
+#     driver: local
+#   neo4j_import:
+#     driver: local
+#   ollama_models:
+#     driver: local
+#   caddy_data:
+#     driver: local
+#   caddy_config:
+#     driver: local
+
+# ─────────────────────────────────────────────────────────────────
+# REDES AISLADAS
+# ─────────────────────────────────────────────────────────────────
+networks:
+  osda-frontend:
+    driver: bridge
+    name: osda-frontend
+  osda-backend:
+    driver: bridge
+    name: osda-backend
+    enable_ipv6: false

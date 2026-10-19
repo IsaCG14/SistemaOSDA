@@ -1,0 +1,37 @@
+# Caddyfile - Producción
+# Requiere DNS válido apuntando al servidor para Let's Encrypt
+# Para solo LAN: usar Caddyfile.dev
+
+{
+    admin off
+    log {
+        output stdout
+        format json
+    }
+}
+
+# Dashboard HTTPS
+https://docs.corposcentro.local {
+    reverse_proxy frontend:80
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}
+
+# API Backend (interno, solo Caddy → Backend)
+http://backend:8000 {
+    reverse_proxy backend:8000
+}
+
+# Graphify (interno)
+http://graphify:8080 {
+    reverse_proxy graphify:8080
+}
+
+# Supabase Kong (interno)
+http://kong:8000 {
+    reverse_proxy supabase-kong:8000
+}

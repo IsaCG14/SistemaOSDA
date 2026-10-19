@@ -1,0 +1,78 @@
+# docker-compose.dev.yml
+# Overrides para desarrollo local (hot-reload, puertos expuestos, logs verbose)
+
+version: "3.9"
+
+services:
+  caddy:
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile:ro
+
+  supabase-kong:
+    ports:
+      - "8000:8000"
+      - "8443:8443"
+
+  neo4j:
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+
+  graphify:
+    ports:
+      - "8080:8080"
+
+  postgrest:
+    ports:
+      - "3000:3000"
+
+  ollama:
+    ports:
+      - "11434:11434"
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 8G
+
+  backend:
+    build:
+      target: development
+    volumes:
+      - ./backend/app:/app/app
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=DEBUG
+      - RELOAD=true
+    ports:
+      - "8001:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  telegram-bot:
+    build:
+      target: development
+    volumes:
+      - ./bot:/app
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=DEBUG
+    command: python -m bot.main --polling
+
+  frontend:
+    build:
+      target: development
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/package.json:/app/package.json
+      - ./frontend/vite.config.ts:/app/vite.config.ts
+    ports:
+      - "5173:5173"
+    command: npm run dev -- --host 0.0.0.0
+
+  migrator:
+    build:
+      target: migrator

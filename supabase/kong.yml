@@ -1,0 +1,190 @@
+# Kong declarative configuration for Office Secretary Document Agent
+# Configures Kong as API gateway for PostgreSQL + Auth + Storage + Graphify
+
+_format_version: "3.0"
+_transform: true
+
+services:
+  # Auth service (GoTrue)
+  - name: auth
+    url: http://supabase-auth:8081
+    routes:
+      - name: auth-route
+        paths:
+          - /auth
+        strip_path: true
+      - name: auth-v1-route
+        paths:
+          - /auth/v1
+        strip_path: true
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - "*"
+          methods:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Authorization
+            - Content-Type
+            - Accept
+          exposed_headers:
+            - X-Total-Count
+          credentials: true
+          max_age: 3600
+
+  # REST API (PostgREST)
+  - name: rest
+    url: http://postgrest:3000
+    routes:
+      - name: rest-route
+        paths:
+          - /rest
+        strip_path: false
+      - name: rest-v1-route
+        paths:
+          - /rest/v1
+        strip_path: true
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - "*"
+          methods:
+            - GET
+            - POST
+            - PATCH
+            - DELETE
+            - OPTIONS
+          headers:
+            - Authorization
+            - Content-Type
+            - Accept
+            - Prefer
+            - Range
+          exposed_headers:
+            - Content-Range
+            - X-Total-Count
+          credentials: true
+          max_age: 3600
+
+  # Graphify API
+  - name: graphify
+    url: http://graphify:8080
+    routes:
+      - name: graphify-route
+        paths:
+          - /graphify
+        strip_path: false
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - "*"
+          methods:
+            - GET
+            - POST
+            - OPTIONS
+          headers:
+            - Authorization
+            - Content-Type
+            - Accept
+          credentials: true
+          max_age: 3600
+
+  # Backend API
+  - name: backend
+    url: http://backend:8000
+    routes:
+      - name: backend-route
+        paths:
+          - /api
+        strip_path: false
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - "*"
+          methods:
+            - GET
+            - POST
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Authorization
+            - Content-Type
+            - Accept
+          credentials: true
+          max_age: 3600
+
+  # Storage proxy (imgproxy)
+  - name: storage
+    url: http://storage-proxy:5001
+    routes:
+      - name: storage-route
+        paths:
+          - /storage
+        strip_path: false
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - "*"
+          methods:
+            - GET
+            - POST
+            - DELETE
+            - OPTIONS
+          headers:
+            - Authorization
+            - Content-Type
+            - Accept
+          credentials: true
+          max_age: 3600
+
+  # Neo4j Browser (admin only)
+  - name: neo4j-browser
+    url: http://neo4j:7474
+    routes:
+      - name: neo4j-browser-route
+        paths:
+          - /neo4j
+        strip_path: false
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - "*"
+          methods:
+            - GET
+            - POST
+            - OPTIONS
+          headers:
+            - Authorization
+            - Content-Type
+            - Accept
+          credentials: true
+          max_age: 3600
+
+# Global plugins
+plugins:
+  # Rate limiting global
+  - name: rate-limiting
+    config:
+      minute: 1000
+      hour: 10000
+      policy: local
+      fault_tolerant: true
+      hide_client_headers: false
+
+  # Request size limit
+  - name: request-transformer
+    config:
+      remove:
+        headers:
+          - x-forwarded-for

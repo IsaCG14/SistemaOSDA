@@ -1,0 +1,34 @@
+# Caddyfile.dev - Desarrollo Local (HTTP only)
+# Para usar en LAN sin certificados TLS
+
+{
+    admin off
+    log {
+        output stdout
+        format json
+    }
+}
+
+# Dashboard HTTP (sin TLS)
+http://localhost {
+    reverse_proxy frontend:80
+}
+
+http://0.0.0.0:80 {
+    reverse_proxy frontend:80
+}
+
+# API Backend (interno)
+http://backend:8000 {
+    reverse_proxy backend:8000
+}
+
+# Graphify (interno)
+http://graphify:8080 {
+    reverse_proxy graphify:8080
+}
+
+# Supabase Kong (interno)
+http://kong:8000 {
+    reverse_proxy supabase-kong:8000
+}
