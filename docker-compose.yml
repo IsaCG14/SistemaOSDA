@@ -100,7 +100,7 @@ services:
     restart: unless-stopped
     environment:
       GOTRUE_DB_DRIVER: postgres
-      GOTRUE_DB_DATABASE_URL: postgres://postgres:changeme_secure_password_min_32_chars@supabase-db:5432/postgres?search_path=auth
+      GOTRUE_DB_DATABASE_URL: postgres://postgres:${SUPABASE_DB_PASSWORD}@supabase-db:5432/postgres?search_path=auth
       GOTRUE_SITE_URL: ${SITE_URL:-http://localhost}
       GOTRUE_URI_ALLOW_LIST: ${SITE_URL:-http://localhost}
       GOTRUE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
@@ -116,7 +116,7 @@ services:
     networks:
       - osda-backend
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9999/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/health"]
       interval: 10s
       timeout: 5s
       retries: 5
