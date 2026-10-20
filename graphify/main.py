@@ -313,7 +313,10 @@ async def get_por_oficina(
     anio: Optional[int] = None,
     drv: Driver = Depends(get_driver)
 ):
-    where = "d.oficina_origen_sigla = $oficina OR d.oficina_destino_sigla = $oficina"
+    # OJO con la precedencia: el OR de oficinas debe ir entre parentesis,
+    # si no AND ate el filtro de fecha solo a la rama "destino" y los
+    # documentos con ORIGEN en la oficina ignoran el mes/anio.
+    where = "(d.oficina_origen_sigla = $oficina OR d.oficina_destino_sigla = $oficina)"
     params = {"oficina": oficina}
 
     if mes and anio:
