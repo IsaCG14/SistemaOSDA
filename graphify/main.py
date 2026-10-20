@@ -112,10 +112,27 @@ class DocumentoCreate(DocumentoBase):
     id: str
 
 
-class DocumentoResponse(DocumentoBase):
+class DocumentoResponse(BaseModel):
+    """Refleja las propiedades tal como las guarda el nodo en Neo4j."""
     id: str
-    created_at: str
-    updated_at: Optional[str] = None
+    correlativo: str
+    tipo_documento: str
+    oficina_origen_sigla: str
+    oficina_destino_sigla: str
+    # Neo4j devuelve tipos nativos (Date/DateTime): se dejan como Any
+    fecha_documento: Any
+    fecha_recepcion: Optional[Any] = None
+    remitente: Optional[str] = None
+    destinatario: Optional[str] = None
+    asunto: Optional[str] = None
+    folios: Optional[int] = None
+    anexos: Optional[List[str]] = None
+    estado: str = "RECIBIDO"
+    prioridad: Optional[str] = "NORMAL"
+    observaciones: Optional[str] = None
+    confianza_ocr: Optional[float] = None
+    created_at: Any
+    updated_at: Optional[Any] = None
 
 
 class TraceResult(BaseModel):
@@ -124,6 +141,22 @@ class TraceResult(BaseModel):
     referencias: List[Dict[str, Any]] = []
     anexos: List[Dict[str, Any]] = []
     flujo_oficinas: List[Dict[str, Any]] = []
+
+
+# ─────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────
+
+def to_plain(obj):
+    """Convierte tipos nativos de Neo4j (Date/DateTime/etc) a tipos JSON-safe."""
+    from neo4j.time import Date, DateTime
+    if isinstance(obj, (Date, DateTime)):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {k: to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_plain(v) for v in obj]
+    return obj
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -180,7 +213,7 @@ async def create_documento(doc: DocumentoCreate, drv: Driver = Depends(get_drive
         result = session.run(query, **doc.model_dump())
         record = result.single()
         if record:
-            return DocumentoResponse(**dict(record["d"]))
+            return DocumentoResponse(**to_plain(dict(record["d"])))
         raise HTTPException(status_code=500, detail="Error creando documento")
 
 
@@ -229,11 +262,11 @@ async def trace_documento(correlativo: str, drv: Driver = Depends(get_driver)):
         ]
     
     return TraceResult(
-        documento=documento,
-        respuestas=respuestas,
-        referencias=referencias,
-        anexos=anexos,
-        flujo_oficinas=flujo_oficinas
+        documento=to_plain(documento),
+        respuestas=to_plain(respuestas),
+        referencias=to_plain(referencias),
+        anexos=to_plain(anexos),
+        flujo_oficinas=to_plain(flujo_oficinas)
     )
 
 
@@ -246,9 +279,9 @@ async def get_pendientes(dias_limite: int = Query(5, ge=1), drv: Driver = Depend
       AND d.fecha_recepcion < date() - duration({days: $dias_limite})
     RETURN d ORDER BY d.fecha_recepcion ASC
     """
-    with driver.session() as session:
+    with drv.session() as session:
         result = session.run(query, dias_limite=dias_limite)
-        return [dict(record["d"]) for record in result]
+        return to_plain([dict(record["d"]) for record in result])
 
 
 @app.get("/consultas/ultimo-correlativo")
@@ -265,7 +298,7 @@ async def get_ultimo_correlativo(
     ORDER BY d.fecha_documento DESC, d.created_at DESC
     LIMIT 1
     """
-    with driver.session() as session:
+    with drv.session() as session:
         result = session.run(query, oficina=oficina, tipo_documento=tipo_documento)
         record = result.single()
         if record:
@@ -277,18 +310,18 @@ async def get_ultimo_correlativo(
 async def get_por_oficina(
     oficina: str = Query(...),
     mes: Optional[int] = None,
-    año: Optional[int] = None,
+    anio: Optional[int] = None,
     drv: Driver = Depends(get_driver)
 ):
     where = "d.oficina_origen_sigla = $oficina OR d.oficina_destino_sigla = $oficina"
     params = {"oficina": oficina}
-    
-    if mes and año:
+
+    if mes and anio:
         where += " AND d.fecha_documento >= date($inicio) AND d.fecha_documento <= date($fin)"
         import calendar
-        params["inicio"] = f"{año}-{mes:02d}-01"
-        last_day = calendar.monthrange(año, mes)[1]
-        params["fin"] = f"{año}-{mes:02d}-{last_day}"
+        params["inicio"] = f"{anio}-{mes:02d}-01"
+        last_day = calendar.monthrange(anio, mes)[1]
+        params["fin"] = f"{anio}-{mes:02d}-{last_day}"
     
     query = f"""
     MATCH (d:Documento)
@@ -296,9 +329,9 @@ async def get_por_oficina(
     RETURN d ORDER BY d.fecha_documento DESC LIMIT 100
     """
     
-    with driver.session() as session:
+    with drv.session() as session:
         result = session.run(query, **params)
-        return [dict(record["d"]) for record in result]
+        return to_plain([dict(record["d"]) for record in result])
 
 
 if __name__ == "__main__":

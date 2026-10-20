@@ -34,7 +34,7 @@ export function ConsultasPage() {
   const { data: pendientes, isLoading: loadingPendientes } = useQuery({
     queryKey: ['pendientes'],
     queryFn: async () => {
-      const resp = await api.get('/graphify/consultas/pendientes')
+      const resp = await api.get('/consultas/pendientes')
       return resp.data
     },
     enabled: activeTab === 'pendientes',
@@ -43,7 +43,7 @@ export function ConsultasPage() {
   const { data: trace, isLoading: loadingTrace } = useQuery({
     queryKey: ['trace', traceCorrelativo],
     queryFn: async () => {
-      const resp = await api.get(`/graphify/trace/${traceCorrelativo}`)
+      const resp = await api.get(`/consultas/trace/${traceCorrelativo}`)
       return resp.data
     },
     enabled: activeTab === 'trace' && traceCorrelativo.length > 0,
@@ -52,7 +52,7 @@ export function ConsultasPage() {
   const { data: ultimoCorrelativo, isLoading: loadingCorrelativo } = useQuery({
     queryKey: ['ultimo-correlativo', correlativoOficina, correlativoTipo],
     queryFn: async () => {
-      const resp = await api.get('/graphify/consultas/ultimo-correlativo', {
+      const resp = await api.get('/consultas/ultimo-correlativo', {
         params: { oficina: correlativoOficina, tipo_documento: correlativoTipo }
       })
       return resp.data
@@ -63,7 +63,7 @@ export function ConsultasPage() {
   const { data: porOficina, isLoading: loadingOficina } = useQuery({
     queryKey: ['por-oficina', oficinaConsulta, mesConsulta, anioConsulta],
     queryFn: async () => {
-      const resp = await api.get('/graphify/consultas/por-oficina', {
+      const resp = await api.get('/consultas/por-oficina', {
         params: { oficina: oficinaConsulta, mes: mesConsulta, anio: anioConsulta }
       })
       return resp.data

@@ -3,7 +3,7 @@ Backend FastAPI Application
 Main entry point for the Office Secretary Document Agent API.
 """
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Dict
 import os
 import logging
 import httpx
@@ -348,7 +348,27 @@ async def create_documento(doc: DocumentoCreate, client: httpx.AsyncClient = Dep
         # Indexar en Graphify (async, no bloquear)
         try:
             if graphify_client:
-                await graphify_client.post("/documentos", json=data, timeout=10)
+                # Graphify espera el esquema viejo (tipo_documento, oficina_origen):
+                # se traduce desde el esquema actual (tipo_doc_codigo, *_sigla)
+                graphify_payload = {
+                    "id": doc_id,
+                    "correlativo": data["correlativo"],
+                    "tipo_documento": data["tipo_doc_codigo"],
+                    "oficina_origen": data["oficina_origen_sigla"],
+                    "oficina_destino": data["oficina_destino_sigla"],
+                    "fecha_documento": data["fecha_documento"],
+                    "fecha_recepcion": data.get("fecha_recepcion"),
+                    "remitente": data.get("remitente"),
+                    "destinatario": data.get("destinatario"),
+                    "asunto": data.get("asunto"),
+                    "folios": data.get("folios"),
+                    "anexos": data.get("anexos") or [],
+                    "estado": data.get("estado", "RECIBIDO"),
+                    "prioridad": data.get("prioridad", "NORMAL"),
+                    "observaciones": data.get("observaciones"),
+                    "confianza_ocr": data.get("confianza_ocr"),
+                }
+                await graphify_client.post("/documentos", json=graphify_payload, timeout=10)
         except Exception as e:
             logger.warning("graphify_index_failed", error=str(e), doc_id=doc_id)
 
@@ -692,7 +712,7 @@ async def trace_documento(correlativo: str, graphify: httpx.AsyncClient = Depend
 async def get_pendientes(dias_limite: int = 5, graphify: httpx.AsyncClient = Depends(get_graphify_client)):
     """Documentos pendientes de respuesta."""
     try:
-        resp = await graphify.get(f"/pendientes?dias={dias_limite}")
+        resp = await graphify.get("/consultas/pendientes", params={"dias_limite": dias_limite})
         if resp.status_code == 200:
             return resp.json()
         raise HTTPException(status_code=500, detail="Error en Graphify")
@@ -711,6 +731,61 @@ async def buscar_documentos(q: str, graphify: httpx.AsyncClient = Depends(get_gr
         raise HTTPException(status_code=500, detail="Error en Graphify")
     except Exception as e:
         logger.error("buscar_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/consultas/ultimo-correlativo")
+async def ultimo_correlativo(
+    oficina: Optional[str] = None,
+    tipo_documento: Optional[str] = None,
+    graphify: httpx.AsyncClient = Depends(get_graphify_client),
+):
+    """Ultimo correlativo por oficina y tipo (via Graphify)."""
+    try:
+        params: Dict[str, str] = {}
+        if oficina:
+            params["oficina"] = oficina
+        if tipo_documento:
+            params["tipo_documento"] = tipo_documento
+        resp = await graphify.get("/consultas/ultimo-correlativo", params=params)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="No hay documentos en el grafo")
+        raise HTTPException(status_code=500, detail="Error en Graphify")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("ultimo_correlativo_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/consultas/por-oficina")
+async def por_oficina(
+    oficina: Optional[str] = None,
+    tipo_documento: Optional[str] = None,
+    mes: Optional[int] = None,
+    anio: Optional[int] = None,
+    limit: int = 50,
+    graphify: httpx.AsyncClient = Depends(get_graphify_client),
+):
+    """Documentos por oficina (via Graphify)."""
+    try:
+        params: Dict[str, str | int] = {"limit": limit}
+        if oficina:
+            params["oficina"] = oficina
+        if tipo_documento:
+            params["tipo_documento"] = tipo_documento
+        if mes:
+            params["mes"] = mes
+        if anio:
+            params["anio"] = anio
+        resp = await graphify.get("/consultas/por-oficina", params=params)
+        if resp.status_code == 200:
+            return resp.json()
+        raise HTTPException(status_code=500, detail="Error en Graphify")
+    except Exception as e:
+        logger.error("por_oficina_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 

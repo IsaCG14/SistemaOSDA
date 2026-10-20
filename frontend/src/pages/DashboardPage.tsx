@@ -124,7 +124,7 @@ export function DashboardPage() {
   const { data: pendientes } = useQuery({
     queryKey: ['pendientes'],
     queryFn: async () => {
-      const resp = await api.get('/graphify/consultas/pendientes')
+      const resp = await api.get('/consultas/pendientes')
       return resp.data
     },
   })
