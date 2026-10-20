@@ -4,12 +4,14 @@ import { LoadingSpinner } from '../components/LoadingSpinner'
 import { EmptyState } from '../components/EmptyState'
 import { format } from 'date-fns'
 import { es } from 'date-fns/locale'
-import { 
-  FileText, Building2, Clock, AlertCircle, CheckCircle, 
-  TrendingUp, TrendingDown, Minus, Plus, Search, Filter, Download, Calendar
+import {
+  FileText, Building2, Clock, AlertCircle, CheckCircle,
+  TrendingUp, TrendingDown, Minus, Plus, Search, Filter, Download, Calendar,
+  Loader2
 } from 'lucide-react'
 import { useState, useEffect } from 'react'
 import { Documento } from '../types'
+import { exportarDocumentosExcel } from '../utils/exportExcel'
 
 const ESTADO_COLORES: Record<string, string> = {
   RECIBIDO: 'badge-info',
@@ -45,6 +47,31 @@ export function DashboardPage() {
   const [fechaHasta, setFechaHasta] = useState('')
   const [oficinaFiltro, setOficinaFiltro] = useState('')
   const [tipoFiltro, setTipoFiltro] = useState('')
+  const [exportando, setExportando] = useState(false)
+
+  // Exportar a Excel los documentos que matchean los filtros del Dashboard
+  const handleExportar = async () => {
+    setExportando(true)
+    try {
+      const total = await exportarDocumentosExcel(async (limit, offset) => {
+        const params = new URLSearchParams()
+        if (fechaDesde) params.append('fecha_desde', fechaDesde)
+        if (fechaHasta) params.append('fecha_hasta', fechaHasta)
+        if (oficinaFiltro) params.append('oficina_origen', oficinaFiltro)
+        if (tipoFiltro) params.append('tipo_documento', tipoFiltro)
+        params.append('limit', limit.toString())
+        params.append('offset', offset.toString())
+        const resp = await api.get(`/documentos?${params}`)
+        return resp.data
+      })
+      alert(`Se exportaron ${total} documento${total === 1 ? '' : 's'} a Excel.`)
+    } catch (err: any) {
+      console.error('Error exportando:', err)
+      alert('No se pudo exportar: ' + (err?.message || 'error desconocido'))
+    } finally {
+      setExportando(false)
+    }
+  }
 
   // Fetch oficinas for select
   const { data: oficinas = [] } = useQuery({
@@ -119,9 +146,13 @@ export function DashboardPage() {
           <p className="text-muted mt-1">Resumen de gestión documental</p>
         </div>
         <div className="flex gap-2">
-          <button className="btn-secondary flex items-center gap-2">
-            <Download className="w-4 h-4" />
-            Exportar Excel
+          <button
+            onClick={() => handleExportar()}
+            disabled={exportando}
+            className="btn-secondary flex items-center gap-2"
+          >
+            {exportando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+            {exportando ? 'Exportando...' : 'Exportar Excel'}
           </button>
         </div>
       </div>

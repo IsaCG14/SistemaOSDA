@@ -11,6 +11,7 @@ import {
 import { Documento } from '../types'
 import { LoadingSpinner } from '../components/LoadingSpinner'
 import { EmptyState } from '../components/EmptyState'
+import { exportarDocumentosExcel } from '../utils/exportExcel'
 
 const ESTADO_COLORES: Record<string, string> = {
   RECIBIDO: 'badge-info',
@@ -40,6 +41,7 @@ export function DocumentosPage() {
   const [fechaDesde, setFechaDesde] = useState('')
   const [fechaHasta, setFechaHasta] = useState('')
   const [showFilters, setShowFilters] = useState(false)
+  const [exportando, setExportando] = useState(false)
   const [selectedDoc, setSelectedDoc] = useState<Documento | null>(null)
   const [editingDoc, setEditingDoc] = useState<Documento | null>(null)
   const [formData, setFormData] = useState({
@@ -146,6 +148,33 @@ export function DocumentosPage() {
     }
   }
 
+  // Exportar a Excel TODOS los documentos que matchean los filtros activos
+  const handleExportar = async () => {
+    setExportando(true)
+    try {
+      const total = await exportarDocumentosExcel(async (limit, offset) => {
+        const params = new URLSearchParams()
+        params.append('limit', limit.toString())
+        params.append('offset', offset.toString())
+        if (debouncedSearch) params.append('search', debouncedSearch)
+        if (estadoFiltro) params.append('estado', estadoFiltro)
+        if (tipoFiltro) params.append('tipo_documento', tipoFiltro)
+        if (oficinaOrigenFiltro) params.append('oficina_origen', oficinaOrigenFiltro)
+        if (oficinaDestinoFiltro) params.append('oficina_destino', oficinaDestinoFiltro)
+        if (fechaDesde) params.append('fecha_desde', fechaDesde)
+        if (fechaHasta) params.append('fecha_hasta', fechaHasta)
+        const resp = await api.get(`/documentos?${params}`)
+        return resp.data
+      })
+      alert(`Se exportaron ${total} documento${total === 1 ? '' : 's'} a Excel.`)
+    } catch (err: any) {
+      console.error('Error exportando:', err)
+      alert('No se pudo exportar: ' + (err?.message || 'error desconocido'))
+    } finally {
+      setExportando(false)
+    }
+  }
+
   const openView = (doc: Documento) => {
     setSelectedDoc(doc)
   }
@@ -212,9 +241,13 @@ export function DocumentosPage() {
           <p className="text-muted mt-1">Gestión y consulta de documentos registrados</p>
         </div>
         <div className="flex gap-2">
-          <button className="btn-secondary flex items-center gap-2">
-            <Download className="w-4 h-4" />
-            Exportar
+          <button
+            onClick={() => handleExportar()}
+            disabled={exportando}
+            className="btn-secondary flex items-center gap-2"
+          >
+            {exportando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+            {exportando ? 'Exportando...' : 'Exportar'}
           </button>
           <button className="btn-primary flex items-center gap-2">
             <Plus className="w-4 h-4" />
