@@ -573,9 +573,13 @@ async def handle_correction_text(update: Update, context: ContextTypes.DEFAULT_T
 def validate_field(field: str, value: str):
     """Validar valor según campo."""
     if field in ["correlativo"]:
-        # Formato básico
-        if re.match(r'^[A-Z]{2,5}-[A-Z]{2,5}-\d{4}-\d{4}$', value):
-            return value
+        # Formatos reales usados por la oficina (secuencia de 3+ digitos al final):
+        #   OTIC-2026-003          -> SIGLA-AÑO-SECUENCIA
+        #   OTIC-MEMO-2026-042     -> SIGLA-TIPO-AÑO-SECUENCIA
+        # Se normaliza a mayusculas y sin espacios antes de validar.
+        v = value.strip().upper()
+        if re.match(r'^[A-Z]{2,6}(-[A-Z]{2,8})?-\d{4}-\d{1,6}$', v):
+            return v
         return None
     
     elif field in ["fecha_documento", "fecha_recepcion"]:
