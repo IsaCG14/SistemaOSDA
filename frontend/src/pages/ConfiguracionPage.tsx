@@ -180,11 +180,42 @@ function GeneralSettings() {
 }
 
 function UsuariosSettings() {
+  const { data: usuarios, isLoading, error } = useQuery({
+    queryKey: ['usuarios'],
+    queryFn: async () => {
+      const resp = await api.get('/usuarios')
+      return resp.data as Array<{
+        email: string
+        role: string
+        activo: boolean
+        email_confirmado: boolean
+        ultimo_acceso: string
+        creado: string
+      }>
+    },
+  })
+
+  const inicial = (email: string) => (email || '?').charAt(0).toUpperCase()
+
+  const formatearFecha = (iso: string) => {
+    if (!iso) return 'Nunca'
+    try {
+      const d = new Date(iso)
+      const ahora = new Date()
+      const horas = Math.floor((ahora.getTime() - d.getTime()) / 3600000)
+      if (horas < 1) return 'Hace instantes'
+      if (horas < 24) return `Hace ${horas} h`
+      return d.toLocaleDateString('es-VE', { day: '2-digit', month: '2-digit', year: 'numeric' })
+    } catch {
+      return iso
+    }
+  }
+
   return (
     <div className="max-w-2xl space-y-6">
       <div className="flex items-center justify-between">
         <h3 className="text-lg font-semibold text-heading">Gestión de Usuarios</h3>
-        <button className="btn-primary flex items-center gap-2">
+        <button className="btn-secondary flex items-center gap-2" disabled title="Los usuarios se registran desde la pantalla de login">
           <Plus className="w-4 h-4" />
           Invitar Usuario
         </button>
@@ -192,50 +223,68 @@ function UsuariosSettings() {
 
       <div className="card">
         <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead>
-              <tr className="border-b border-default">
-                <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Usuario</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Rol</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Estado</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Último Acceso</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Acciones</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-default">
-              <tr>
-                <td className="px-4 py-3">
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center">
-                      <span className="text-blue-700 dark:text-blue-400 font-medium">A</span>
-                    </div>
-                    <div>
-                      <p className="font-medium text-heading">Admin Sistema</p>
-                      <p className="text-sm text-muted">admin@ejemplo.gob.ve</p>
-                    </div>
-                  </div>
-                </td>
-                <td className="px-4 py-3">
-                  <span className="badge badge-danger">ADMIN</span>
-                </td>
-                <td className="px-4 py-3">
-                  <span className="badge badge-success">Activo</span>
-                </td>
-                <td className="px-4 py-3 text-sm text-muted">Hace 2 horas</td>
-                <td className="px-4 py-3">
-                  <button className="text-muted hover:text-heading">Editar</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+          {isLoading ? (
+            <div className="p-8 text-center text-muted">Cargando usuarios…</div>
+          ) : error ? (
+            <div className="p-8 text-center text-red-600 dark:text-red-400">
+              Error cargando usuarios: {(error as Error).message}
+            </div>
+          ) : (
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-default">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Usuario</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Rol</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Estado</th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Último Acceso</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-default">
+                {usuarios?.map((u) => (
+                  <tr key={u.email} className="card-hover">
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center">
+                          <span className="text-blue-700 dark:text-blue-400 font-medium">{inicial(u.email)}</span>
+                        </div>
+                        <div>
+                          <p className="font-medium text-heading">{u.email}</p>
+                          {!u.email_confirmado && (
+                            <p className="text-xs text-yellow-600 dark:text-yellow-400">Email sin confirmar</p>
+                          )}
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={`badge ${u.role === 'ADMIN' ? 'badge-danger' : 'badge-info'}`}>{u.role}</span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={`badge ${u.activo ? 'badge-success' : 'badge-gray'}`}>
+                        {u.activo ? 'Activo' : 'Suspendido'}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-sm text-muted">{formatearFecha(u.ultimo_acceso)}</td>
+                  </tr>
+                ))}
+                {!usuarios?.length && (
+                  <tr>
+                    <td colSpan={4} className="px-4 py-8 text-center text-muted">
+                      No hay usuarios registrados
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
 
       <div className="card p-6 border-border bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800">
         <h4 className="font-medium text-blue-900 dark:text-blue-300 mb-2">Autenticación</h4>
         <p className="text-sm text-blue-700 dark:text-blue-400">
-          Los usuarios se autentican vía Supabase Auth (email + magic link).
-          Los roles se gestionan desde la tabla <code>personas</code> con <code>telegram_user_id</code>.
+          Los usuarios se autentican vía Supabase Auth (email y contraseña). El rol se asigna al
+          crear la cuenta (ADMIN o SECRETARIO). Esta vista es de solo lectura: para invitar a
+          alguien, regístralo desde la pantalla de login.
         </p>
       </div>
     </div>

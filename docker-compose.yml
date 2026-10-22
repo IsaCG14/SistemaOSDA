@@ -351,6 +351,7 @@ services:
       - HTTPS_PROXY=${HTTP_PROXY:-}
       - HTTP_PROXY=${HTTP_PROXY:-}
       - NO_PROXY=localhost,127.0.0.0/8,::1,backend,ollama,postgres,supabase-kong,supabase-*,graphify,neo4j,192.168.0.0/16,172.16.0.0/12,osda-backend,supabase-kong
+      - SUPABASE_DB_PASSWORD=${SUPABASE_DB_PASSWORD}
     volumes:
       - ./backend/app:/app/app:ro
     depends_on:

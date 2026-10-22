@@ -49,8 +49,9 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "http://supabase-kong:8000")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 GRAPHIFY_URL = os.getenv("GRAPHIFY_URL", "http://graphify:8080")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://172.18.0.11:11434")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
 VISION_MODEL = os.getenv("VISION_MODEL", "llava:latest")
+SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
 
 # Cliente HTTP global para Supabase (PostgREST via Kong)
 supabase_http_client: Optional[httpx.AsyncClient] = None
@@ -786,6 +787,61 @@ async def por_oficina(
         raise HTTPException(status_code=500, detail="Error en Graphify")
     except Exception as e:
         logger.error("por_oficina_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINTS - USUARIOS (auth.users, lectura via psycopg directo)
+# ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/usuarios")
+async def list_usuarios():
+    """Listar cuentas de login (auth.users) - SOLO LECTURA.
+
+    Lee email, rol, estado y ultimo acceso desde el schema auth
+    (no expuesto por PostgREST) via conexion directa a Postgres.
+    No modifica nada.
+    """
+    import psycopg
+    if not SUPABASE_DB_PASSWORD:
+        raise HTTPException(status_code=500, detail="SUPABASE_DB_PASSWORD no configurada en el backend")
+    try:
+        conn = psycopg.connect(
+            host="supabase-db",
+            dbname="postgres",
+            user="postgres",
+            password=SUPABASE_DB_PASSWORD,
+            port=5432,
+            connect_timeout=5,
+        )
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT u.email,
+                       coalesce(u.raw_user_meta_data->>'role', 'SECRETARIO') as role,
+                       (u.banned_until IS NULL) as activo,
+                       coalesce(u.email_confirmed_at::text, '') as confirmado,
+                       coalesce(u.last_sign_in_at::text, u.created_at::text) as ultimo_acceso,
+                       u.created_at::text as creado
+                FROM auth.users u
+                ORDER BY u.created_at ASC
+            """)
+            filas = cur.fetchall()
+        conn.close()
+        return [
+            {
+                "email": f[0],
+                "role": f[1],
+                "activo": f[2],
+                "email_confirmado": bool(f[3]),
+                "ultimo_acceso": f[4],
+                "creado": f[5],
+            }
+            for f in filas
+        ]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("list_usuarios_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
