@@ -794,8 +794,51 @@ async def por_oficina(
 # ENDPOINTS - USUARIOS (auth.users, lectura via psycopg directo)
 # ─────────────────────────────────────────────────────────────────
 
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
+
+class UsuarioCreate(BaseModel):
+    email: str
+    password: str
+    role: str = "SECRETARIO"
+    nombre: Optional[str] = None
+
+
+def _caller_role(request: Request) -> Optional[str]:
+    """Rol del usuario autenticado que hace la peticion (None si token invalido)."""
+    from jose import jwt as jose_jwt, JWTError
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        return None
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        # GoTrue firma con aud="" (vacio) y python-jose lo valida estrictamente:
+        # se omite la validacion de audience; la FIRMA sigue verificada.
+        payload = jose_jwt.decode(
+            token, SUPABASE_JWT_SECRET, algorithms=["HS256"],
+            options={"verify_aud": False},
+        )
+    except JWTError:
+        return None
+    sub = payload.get("sub")
+    if not sub or not SUPABASE_DB_PASSWORD:
+        return None
+    # El rol vive en raw_user_meta_data: se lee de la BD para no depender
+    # de tokens viejos con roles desactualizados
+    import psycopg
+    try:
+        conn = psycopg.connect(host="supabase-db", dbname="postgres", user="postgres",
+                               password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5)
+        with conn.cursor() as cur:
+            cur.execute("SELECT raw_user_meta_data->>'role' FROM auth.users WHERE id = %s", (sub,))
+            fila = cur.fetchone()
+        conn.close()
+        return fila[0] if fila else None
+    except Exception:
+        return None
+
+
 @app.get("/api/usuarios")
-async def list_usuarios():
+async def list_usuarios(request: Request):
     """Listar cuentas de login (auth.users) - SOLO LECTURA.
 
     Lee email, rol, estado y ultimo acceso desde el schema auth
@@ -842,6 +885,88 @@ async def list_usuarios():
         raise
     except Exception as e:
         logger.error("list_usuarios_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/usuarios", status_code=201)
+async def create_usuario(nuevo: UsuarioCreate, request: Request):
+    """Registrar un usuario nuevo (solo ADMIN).
+
+    Crea la cuenta via GoTrue Admin API (nunca se insertan password
+    hashes a mano). El rol queda en raw_user_meta_data.
+    """
+    import psycopg
+    # 1. Solo ADMIN puede crear usuarios
+    rol = _caller_role(request)
+    if rol != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede registrar usuarios")
+
+    # 2. Validaciones
+    email = nuevo.email.strip().lower()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Email inválido")
+    if len(nuevo.password) < 8:
+        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
+    if nuevo.role not in ("ADMIN", "SECRETARIO"):
+        raise HTTPException(status_code=400, detail="Rol inválido (ADMIN o SECRETARIO)")
+
+    # 3. ¿Ya existe?
+    try:
+        conn = psycopg.connect(host="supabase-db", dbname="postgres", user="postgres",
+                               password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM auth.users WHERE email = %s", (email,))
+            if cur.fetchone():
+                conn.close()
+                raise HTTPException(status_code=409, detail="Ya existe un usuario con ese email")
+        conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("create_usuario_check_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # 4. Crear via GoTrue Admin API (hash de password correcto)
+    try:
+        admin_client = httpx.AsyncClient(timeout=15, trust_env=False)
+        resp = await admin_client.post(
+            f"{SUPABASE_URL}/auth/v1/admin/users",
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "email": email,
+                "password": nuevo.password,
+                "email_confirm": True,
+                "user_metadata": {
+                    "role": nuevo.role,
+                    **({"nombre": nuevo.nombre} if nuevo.nombre else {}),
+                },
+            },
+        )
+        await admin_client.aclose()
+        if resp.status_code not in (200, 201):
+            detail = "Error creando usuario en GoTrue"
+            try:
+                detail = resp.json().get("msg") or resp.json().get("message") or detail
+            except Exception:
+                pass
+            logger.error("create_usuario_gotrue_failed", status=resp.status_code, body=resp.text[:300])
+            raise HTTPException(status_code=resp.status_code, detail=detail)
+        creado = resp.json()
+        logger.info("usuario_creado", email=email, rol=nuevo.role)
+        return {
+            "email": creado.get("email", email),
+            "role": nuevo.role,
+            "activo": True,
+            "email_confirmado": True,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("create_usuario_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 

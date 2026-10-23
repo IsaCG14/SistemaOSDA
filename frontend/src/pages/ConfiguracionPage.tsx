@@ -6,6 +6,7 @@ import {
   Loader2, Save, CheckCircle, AlertCircle, Plus
 } from 'lucide-react'
 import { LoadingSpinner } from '../components/LoadingSpinner'
+import { useAuth } from '../hooks/useAuth'
 import { format } from 'date-fns'
 import { es } from 'date-fns/locale'
 
@@ -180,6 +181,15 @@ function GeneralSettings() {
 }
 
 function UsuariosSettings() {
+  const queryClient = useQueryClient()
+  const { user } = useAuth()
+  const [showModal, setShowModal] = useState(false)
+  const [form, setForm] = useState({ email: '', password: '', confirmar: '', role: 'SECRETARIO', nombre: '' })
+  const [errorMsg, setErrorMsg] = useState('')
+
+  const esAdmin =
+    (user as any)?.user_metadata?.role === 'ADMIN' || (user as any)?.app_metadata?.role === 'ADMIN'
+
   const { data: usuarios, isLoading, error } = useQuery({
     queryKey: ['usuarios'],
     queryFn: async () => {
@@ -194,6 +204,41 @@ function UsuariosSettings() {
       }>
     },
   })
+
+  const crearMutation = useMutation({
+    mutationFn: async (datos: { email: string; password: string; role: string; nombre?: string }) => {
+      const resp = await api.post('/usuarios', datos)
+      return resp.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['usuarios'] })
+      setShowModal(false)
+      setForm({ email: '', password: '', confirmar: '', role: 'SECRETARIO', nombre: '' })
+      setErrorMsg('')
+    },
+    onError: (err: any) => {
+      setErrorMsg(err?.response?.data?.detail || err?.message || 'Error desconocido')
+    },
+  })
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault()
+    setErrorMsg('')
+    if (form.password !== form.confirmar) {
+      setErrorMsg('Las contraseñas no coinciden')
+      return
+    }
+    if (form.password.length < 8) {
+      setErrorMsg('La contraseña debe tener al menos 8 caracteres')
+      return
+    }
+    crearMutation.mutate({
+      email: form.email,
+      password: form.password,
+      role: form.role,
+      ...(form.nombre ? { nombre: form.nombre } : {}),
+    })
+  }
 
   const inicial = (email: string) => (email || '?').charAt(0).toUpperCase()
 
@@ -215,10 +260,15 @@ function UsuariosSettings() {
     <div className="max-w-2xl space-y-6">
       <div className="flex items-center justify-between">
         <h3 className="text-lg font-semibold text-heading">Gestión de Usuarios</h3>
-        <button className="btn-secondary flex items-center gap-2" disabled title="Los usuarios se registran desde la pantalla de login">
-          <Plus className="w-4 h-4" />
-          Invitar Usuario
-        </button>
+        {esAdmin && (
+          <button
+            onClick={() => setShowModal(true)}
+            className="btn-primary flex items-center gap-2"
+          >
+            <Plus className="w-4 h-4" />
+            Registrar Usuario
+          </button>
+        )}
       </div>
 
       <div className="card">
@@ -282,11 +332,115 @@ function UsuariosSettings() {
       <div className="card p-6 border-border bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800">
         <h4 className="font-medium text-blue-900 dark:text-blue-300 mb-2">Autenticación</h4>
         <p className="text-sm text-blue-700 dark:text-blue-400">
-          Los usuarios se autentican vía Supabase Auth (email y contraseña). El rol se asigna al
-          crear la cuenta (ADMIN o SECRETARIO). Esta vista es de solo lectura: para invitar a
-          alguien, regístralo desde la pantalla de login.
+          Los usuarios se autentican vía Supabase Auth (email y contraseña).
+          {!esAdmin && ' Solo un ADMIN puede registrar nuevos usuarios.'}
         </p>
       </div>
+
+      {/* Modal: Registrar usuario */}
+      {showModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setShowModal(false)}>
+          <div
+            className="card w-full max-w-md p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-heading">Registrar Usuario</h3>
+              <button onClick={() => setShowModal(false)} className="text-muted hover:text-heading text-xl leading-none" aria-label="Cerrar">
+                ×
+              </button>
+            </div>
+
+            <form onSubmit={submit} className="space-y-4">
+              <div>
+                <label className="label">Email</label>
+                <input
+                  type="email"
+                  required
+                  value={form.email}
+                  onChange={(e) => setForm({ ...form, email: e.target.value })}
+                  className="input w-full"
+                  placeholder="nombre@institucion.gob.ve"
+                  autoComplete="off"
+                />
+              </div>
+              <div>
+                <label className="label">Nombre (opcional)</label>
+                <input
+                  type="text"
+                  value={form.nombre}
+                  onChange={(e) => setForm({ ...form, nombre: e.target.value })}
+                  className="input w-full"
+                  placeholder="Nombre y apellido"
+                  autoComplete="off"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="label">Contraseña</label>
+                  <input
+                    type="password"
+                    required
+                    minLength={8}
+                    value={form.password}
+                    onChange={(e) => setForm({ ...form, password: e.target.value })}
+                    className="input w-full"
+                    placeholder="Mínimo 8 caracteres"
+                    autoComplete="new-password"
+                  />
+                </div>
+                <div>
+                  <label className="label">Confirmar</label>
+                  <input
+                    type="password"
+                    required
+                    value={form.confirmar}
+                    onChange={(e) => setForm({ ...form, confirmar: e.target.value })}
+                    className="input w-full"
+                    placeholder="Repetir contraseña"
+                    autoComplete="new-password"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="label">Rol</label>
+                <select
+                  value={form.role}
+                  onChange={(e) => setForm({ ...form, role: e.target.value })}
+                  className="input w-full"
+                >
+                  <option value="SECRETARIO">SECRETARIO</option>
+                  <option value="ADMIN">ADMIN</option>
+                </select>
+              </div>
+
+              {errorMsg && (
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 text-sm">
+                  {errorMsg}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowModal(false)}
+                  className="btn-secondary"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={crearMutation.isPending}
+                  className="btn-primary flex items-center gap-2"
+                >
+                  {crearMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
+                  {crearMutation.isPending ? 'Creando...' : 'Crear Usuario'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
