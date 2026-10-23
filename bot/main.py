@@ -28,6 +28,19 @@ from bot.handlers.telegram_handlers import (
     handle_document,
     handle_callback,
     handle_correction_text,
+    doc_command,
+    documentos_command,
+    fecha_command,
+    estado_command,
+    oficina_command,
+    resumen_command,
+    paginacion_callback,
+    memos_command,
+    notas_command,
+    oficios_command,
+    informes_command,
+    circulares_command,
+    actas_command,
 )
 
 # Configurar logging
@@ -55,6 +68,20 @@ async def setup_application(polling: bool = True) -> Application:
     application.add_handler(CommandHandler("pendientes", pendientes_command))
     application.add_handler(CommandHandler("correlativo", correlativo_command))
     application.add_handler(CommandHandler("buscar", buscar_command))
+
+    # Consultas de documentos (backend/Postgres, solo lectura)
+    application.add_handler(CommandHandler("doc", doc_command))
+    application.add_handler(CommandHandler("documentos", documentos_command))
+    application.add_handler(CommandHandler("memos", memos_command))
+    application.add_handler(CommandHandler("notas", notas_command))
+    application.add_handler(CommandHandler("oficios", oficios_command))
+    application.add_handler(CommandHandler("informes", informes_command))
+    application.add_handler(CommandHandler("circulares", circulares_command))
+    application.add_handler(CommandHandler("actas", actas_command))
+    application.add_handler(CommandHandler("fecha", fecha_command))
+    application.add_handler(CommandHandler("estado", estado_command))
+    application.add_handler(CommandHandler("oficina", oficina_command))
+    application.add_handler(CommandHandler("resumen", resumen_command))
     
     # Handler para documentos (fotos y archivos)
     application.add_handler(MessageHandler(

@@ -2,7 +2,7 @@
 Telegram Bot Handlers for document processing workflow.
 """
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,16 +27,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     welcome = (
         "🤖 **Office Secretary Document Agent**\n\n"
-        "Envía una foto o PDF de un documento (memorándum, oficio, informe, etc.) "
-        "y yo extraeré los datos automáticamente.\n\n"
-        "**Comandos disponibles:**\n"
-        "/nuevo - Iniciar registro (o solo envía la foto)\n"
-        "/buscar <término> - Buscar documentos\n"
-        "/correlativo <oficina> <tipo> - Ver último correlativo\n"
-        "/pendientes - Ver documentos pendientes\n"
-        "/oficinas - Listar oficinas\n"
-        "/tipos - Listar tipos de documento\n"
-        "/ayuda - Mostrar esta ayuda"
+        "Envía una foto o PDF de un documento y extraeré los datos automáticamente.\n\n"
+        "**Consultas:**\n"
+        "/doc <correlativo> — ficha de un documento\n"
+        "/documentos [tipo] — listado paginado\n"
+        "/memos /notas /oficios /informes — atajos por tipo\n"
+        "/buscar <término> — búsqueda (ignora acentos)\n"
+        "/fecha <DD/MM/AAAA | MM/AAAA | AAAA> [tipo]\n"
+        "/estado <estado> — por estado del trámite\n"
+        "/oficina <sigla> [origen|destino]\n"
+        "/resumen — métricas rápidas\n\n"
+        "**Registro:**\n"
+        "/pendientes — documentos pendientes\n"
+        "/correlativo <oficina> <tipo> — último correlativo\n\n"
+        "**Catálogos:**\n"
+        "/oficinas · /tipos · /ayuda"
     )
     await update.message.reply_text(welcome, parse_mode="Markdown")
 
@@ -174,12 +179,14 @@ async def buscar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     termino = " ".join(args)
     
     try:
-        results = await graphify_client.search_documents(termino, limit=10)
+        # Buscar en el backend (Postgres): search sin acentos, mas completo que el grafo
+        from bot.core.backend_client import consultar_documentos
+        results = await consultar_documentos(search=termino, limit=10)
         
         if results:
             texto = f"🔍 **Resultados para '{termino}' ({len(results)}):**\n\n"
             for d in results:
-                texto += f"• `{d.get('correlativo', 'N/A')}` - {d.get('asunto', 'Sin asunto')[:50]}\n"
+                texto += f"• `{d.get('correlativo', 'N/A')}` - {(d.get('asunto') or 'Sin asunto')[:60]}\n"
                 texto += f"  📅 {d.get('fecha_documento', 'N/A')} | {d.get('estado', 'N/A')}\n"
         else:
             texto = f"📭 No se encontraron documentos con '{termino}'"
@@ -188,6 +195,299 @@ async def buscar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error en buscar_command: {e}")
         await update.message.reply_text("❌ Error en búsqueda")
+
+
+# ─────────────────────────────────────────────────────────────────
+# CONSULTAS DE DOCUMENTOS (via backend / Postgres, solo lectura)
+# ─────────────────────────────────────────────────────────────────
+
+PAGE_SIZE = 8  # docs por pagina en listados (limite seguro de 4096 chars)
+
+
+def _fmt_fecha(f: Optional[str]) -> str:
+    """YYYY-MM-DD -> DD/MM/YYYY; '' si vacio."""
+    if not f:
+        return ""
+    try:
+        a, m, d = f.split("-")
+        return f"{d}/{m}/{a}"
+    except Exception:
+        return str(f)
+
+
+def _fmt_doc_line(d: Dict[str, Any], n: int) -> str:
+    """Una linea de listado: correlativo + fecha + asunto truncado."""
+    asunto = (d.get("asunto") or "Sin asunto")[:60]
+    return (
+        f"{n}. `{d.get('correlativo', 'N/A')}` — {_fmt_fecha(d.get('fecha_documento'))}\n"
+        f"   {asunto}\n"
+    )
+
+
+def _filtros_clave(filtros: Dict[str, Any]) -> str:
+    """Clave estable para guardar el estado de paginacion en user_data."""
+    return "|".join(f"{k}={v}" for k, v in sorted(filtros.items()) if v)
+
+
+async def _listar_documentos(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    filtros: Dict[str, Any],
+    titulo: str,
+    pagina: int = 0,
+    editar_mensaje=None,
+):
+    """Listar documentos paginados. Responde al mensaje o edita uno existente (paginacion)."""
+    try:
+        from bot.core.backend_client import consultar_documentos
+        docs = await consultar_documentos(
+            limit=PAGE_SIZE + 1,
+            offset=pagina * PAGE_SIZE,
+            **filtros,
+        )
+    except Exception as e:
+        logger.error(f"listar_documentos_failed: {e}")
+        if editar_mensaje:
+            await editar_mensaje.edit_text("❌ El servicio no respondió, intenta de nuevo.")
+        else:
+            await update.message.reply_text("❌ El servicio no respondió, intenta de nuevo.")
+        return
+
+    hay_mas = len(docs) > PAGE_SIZE
+    docs = docs[:PAGE_SIZE]
+
+    if not docs and pagina == 0:
+        texto = f"📭 {titulo}: no hay documentos."
+        if editar_mensaje:
+            await editar_mensaje.edit_text(texto)
+        else:
+            await update.message.reply_text(texto)
+        return
+
+    texto = f"📋 **{titulo}** — pág {pagina + 1}\n\n"
+    for i, d in enumerate(docs, start=1):
+        texto += _fmt_doc_line(d, pagina * PAGE_SIZE + i)
+    if not hay_mas and pagina > 0:
+        texto += "\n_Fin de la lista_"
+
+    # Guardar filtros para que el callback de paginacion los recupere
+    filtros_key = str(abs(hash(_filtros_clave(filtros))) % 10**8)
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    botones = []
+    if pagina > 0 or hay_mas:
+        fila = []
+        if pagina > 0:
+            fila.append(InlineKeyboardButton("◀️ Anterior", callback_data=f"page:{pagina - 1}:{filtros_key}"))
+        if hay_mas:
+            fila.append(InlineKeyboardButton(f"Pág {pagina + 1} ▶️", callback_data=f"page:{pagina + 1}:{filtros_key}"))
+        botones.append(fila)
+    markup = InlineKeyboardMarkup(botones) if botones else None
+
+    # user_data del usuario que consulta (via context de PTB)
+    if update.effective_user is not None and hasattr(context, "user_data"):
+        context.user_data.setdefault("pag_filtros", {})[filtros_key] = filtros
+
+    if editar_mensaje:
+        await editar_mensaje.edit_text(texto, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await update.message.reply_text(texto, parse_mode="Markdown", reply_markup=markup)
+
+
+def _args_a_filtros(args, tipo: Optional[str] = None) -> Dict[str, Any]:
+    """Construir filtros de consulta desde argumentos simples."""
+    filtros: Dict[str, Any] = {}
+    if tipo:
+        filtros["tipo_documento"] = tipo
+    return filtros
+
+
+async def doc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /doc <correlativo> - Ficha completa de un documento."""
+    if not is_authorized(update.effective_chat.id, update.effective_user.id, update.message.message_thread_id):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: `/doc <correlativo>`\nEj: `/doc OTIC-NOTA-2026-042`", parse_mode="Markdown")
+        return
+    correlativo = " ".join(args).strip().upper()
+    try:
+        from bot.core.backend_client import consultar_documentos
+        docs = await consultar_documentos(search=correlativo, limit=20)
+    except Exception as e:
+        logger.error(f"doc_command_failed: {e}")
+        await update.message.reply_text("❌ El servicio no respondió, intenta de nuevo.")
+        return
+
+    exacto = next((d for d in docs if (d.get("correlativo") or "").upper() == correlativo), None)
+    if not exacto:
+        if docs:
+            sug = "\n".join(f"• `{d.get('correlativo')}`" for d in docs[:5])
+            await update.message.reply_text(
+                f"📭 No hay documento exacto `{correlativo}`.\n\n¿Quisiste decir?:\n{sug}",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(f"📭 No se encontró `{correlativo}`.")
+        return
+
+    d = exacto
+    anexos = d.get("anexos") or []
+    texto = (
+        f"📄 **{d.get('correlativo', 'N/A')}** ({d.get('tipo_doc_codigo') or d.get('tipo_documento') or '?'})\n"
+        f"📅 Doc: {_fmt_fecha(d.get('fecha_documento'))} | Rec: {_fmt_fecha(d.get('fecha_recepcion'))}\n"
+        f"🏢 {d.get('oficina_origen_sigla') or '?'} → {d.get('oficina_destino_sigla') or '?'}\n"
+        f"📝 {d.get('asunto') or 'Sin asunto'}\n"
+    )
+    if d.get("remitente"):
+        texto += f"👤 {d['remitente']}\n"
+    if d.get("destinatario"):
+        texto += f"📬 {d['destinatario']}\n"
+    texto += f"📌 Estado: {d.get('estado', '?')} | Prioridad: {d.get('prioridad', 'NORMAL')}\n"
+    if anexos:
+        texto += "📎 Anexos: " + ", ".join(str(a) for a in anexos[:5]) + "\n"
+    if d.get("folios"):
+        texto += f"📄 Folios: {d['folios']}\n"
+    if d.get("observaciones"):
+        texto += f"💬 {(d['observaciones'] or '')[:200]}\n"
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
+
+async def documentos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /documentos [TIPO] - Listado paginado."""
+    if not is_authorized(update.effective_chat.id, update.effective_user.id, update.message.message_thread_id):
+        return
+    from bot.core.backend_client import TIPOS_VALIDOS
+    tipo = args[0].upper() if (args := context.args) and args[0].upper() in TIPOS_VALIDOS else None
+    titulo = f"Documentos — {tipo}" if tipo else "Documentos (todos)"
+    filtros = {"tipo_documento": tipo} if tipo else {}
+    await _listar_documentos(update, context, filtros, titulo)
+
+
+def _alias_tipo(tipo: str):
+    """Genera un handler de alias: /memos == /documentos MEMO."""
+    async def _handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_authorized(update.effective_chat.id, update.effective_user.id, update.message.message_thread_id):
+            return
+        await _listar_documentos(update, context, {"tipo_documento": tipo}, f"{tipo}s")
+    return _handler
+
+
+memos_command = _alias_tipo("MEMO")
+notas_command = _alias_tipo("NOTA")
+oficios_command = _alias_tipo("OFICIO")
+informes_command = _alias_tipo("INFORME")
+circulares_command = _alias_tipo("CIRCULAR")
+actas_command = _alias_tipo("ACTA")
+
+
+async def fecha_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /fecha <fecha> [tipo] - Documentos por dia/mes/anio."""
+    if not is_authorized(update.effective_chat.id, update.effective_user.id, update.message.message_thread_id):
+        return
+    from bot.core.backend_client import parsear_fecha, extraer_tipo
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: `/fecha <DD/MM/AAAA | MM/AAAA | AAAA> [tipo]`\n"
+            "Ej: `/fecha 19/08/2026` · `/fecha 08/2026 memos`",
+            parse_mode="Markdown",
+        )
+        return
+    tipo, resto = extraer_tipo(args)
+    rango = parsear_fecha(" ".join(resto))
+    if not rango:
+        await update.message.reply_text(
+            "❌ Fecha inválida. Usa `DD/MM/AAAA`, `MM/AAAA` o `AAAA`.",
+            parse_mode="Markdown",
+        )
+        return
+    filtros = {"fecha_desde": rango[0], "fecha_hasta": rango[1]}
+    if tipo:
+        filtros["tipo_documento"] = tipo
+    await _listar_documentos(update, context, filtros, f"Fecha {' '.join(resto)}" + (f" — {tipo}" if tipo else ""))
+
+
+async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /estado <ESTADO> - Documentos por estado."""
+    if not is_authorized(update.effective_chat.id, update.effective_user.id, update.message.message_thread_id):
+        return
+    from bot.core.backend_client import ESTADOS_VALIDOS
+    args = context.args
+    if not args or args[0].upper() not in ESTADOS_VALIDOS:
+        await update.message.reply_text(
+            "Uso: `/estado <estado>`\nEstados: " + ", ".join(ESTADOS_VALIDOS),
+            parse_mode="Markdown",
+        )
+        return
+    estado = args[0].upper()
+    await _listar_documentos(update, {"estado": estado}, f"Estado {estado}")
+
+
+async def oficina_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /oficina <SIGLA> [origen|destino] - Documentos de una oficina."""
+    if not is_authorized(update.effective_chat.id, update.effective_user.id, update.message.message_thread_id):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: `/oficina <SIGLA> [origen|destino]`\nEj: `/oficina OTIC` · `/oficina JUR destino`",
+            parse_mode="Markdown",
+        )
+        return
+    sigla = args[0].upper()
+    modo = args[1].lower() if len(args) > 1 and args[1].lower() in ("origen", "destino") else "origen"
+    filtros = {"oficina_origen": sigla} if modo == "origen" else {"oficina_destino": sigla}
+    await _listar_documentos(update, context, filtros, f"Oficina {sigla} ({modo})")
+
+
+async def resumen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /resumen - Metricas rapidas del sistema."""
+    if not is_authorized(update.effective_chat.id, update.effective_user.id, update.message.message_thread_id):
+        return
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+            r = await client.get("http://osda-backend:8000/api/documentos/metricas")
+            r.raise_for_status()
+            m = r.json()
+            r2 = await client.get("http://osda-backend:8000/api/documentos", params={"limit": 1})
+            r2.raise_for_status()
+            ultimo = (r2.json() or [{}])[0]
+    except Exception as e:
+        logger.error(f"resumen_command_failed: {e}")
+        await update.message.reply_text("❌ El servicio no respondió, intenta de nuevo.")
+        return
+
+    por_tipo = ", ".join(f"{t['count']} {t['tipo']}" for t in (m.get("por_tipo") or [])) or "—"
+    por_estado = ", ".join(f"{e['count']} {e['estado']}" for e in (m.get("por_estado") or [])) or "—"
+    texto = (
+        f"📊 **Resumen documental**\n\n"
+        f"• Total: **{m.get('total', 0)}** documentos\n"
+        f"• Por tipo: {por_tipo}\n"
+        f"• Por estado: {por_estado}\n"
+        f"• Este mes: {m.get('este_mes', 0)}\n"
+        f"• Último registro: `{ultimo.get('correlativo', '—')}` ({_fmt_fecha(ultimo.get('fecha_documento'))})\n\n"
+        f"_Usa /doc <correlativo> para ver uno, /ayuda para todo el menú._"
+    )
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
+
+async def paginacion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback de botones de paginacion: page:<pagina>:<filtros_key>. (answer ya hecho arriba)"""
+    query = update.callback_query
+    data = query.data
+    try:
+        _, pagina_s, filtros_key = data.split(":", 2)
+        pagina = int(pagina_s)
+    except Exception:
+        await query.edit_message_text("❌ Acción expirada.")
+        return
+    store = context.user_data if context is not None else {}
+    filtros = (store.get("pag_filtros") or {}).get(filtros_key)
+    if filtros is None:
+        await query.edit_message_text("❌ La consulta expiró. Vuelve a ejecutar el comando.")
+        return
+    await _listar_documentos(update, context, filtros, "Resultados", pagina=pagina, editar_mensaje=query.message)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -321,7 +621,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split(":", 2)
     action = parts[0]
     doc_key = parts[1] if len(parts) > 1 else ""
-    
+
+    # Paginacion de listados de consulta (no depende de documentos pendientes)
+    if action == "page":
+        await paginacion_callback(update, context)
+        return
+
     if doc_key not in context.bot_data:
         await query.edit_message_text("❌ Documento no encontrado o expirado.")
         return
