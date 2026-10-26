@@ -59,6 +59,20 @@ async def setup_application(polling: bool = True) -> Application:
         sys.exit(1)
     
     application = Application.builder().token(get_settings_instance().TELEGRAM_BOT_TOKEN).build()
+
+    # Log de TODO update entrante (diagnostico: saber que le llega al bot)
+    from telegram.ext import TypeHandler
+
+    async def _log_update(update, context):
+        msg = update.effective_message
+        logger.info(
+            f"UPDATE recibido: chat={update.effective_chat.id if update.effective_chat else '?'} "
+            f"user={update.effective_user.id if update.effective_user else '?'} "
+            f"thread={getattr(msg, 'message_thread_id', None) if msg else '-'} "
+            f"text={repr(msg.text[:80]) if msg and msg.text else '(no texto)'}"
+        )
+
+    application.add_handler(TypeHandler(object, _log_update), group=-1)
     
     # Handlers de comandos
     application.add_handler(CommandHandler("start", start_command))
