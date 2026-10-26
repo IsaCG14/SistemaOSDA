@@ -58,7 +58,21 @@ async def setup_application(polling: bool = True) -> Application:
         logger.error("TELEGRAM_BOT_TOKEN no configurado")
         sys.exit(1)
     
-    application = Application.builder().token(get_settings_instance().TELEGRAM_BOT_TOKEN).build()
+    # Timeouts generosos: la red institucional tiene picos de ~9s contra
+    # api.telegram.org (medido: mediana 2s, max 9.3s). Los 5s por defecto
+    # de PTB expiraban y mataban descargas y ediciones de mensajes.
+    application = (
+        Application.builder()
+        .token(get_settings_instance().TELEGRAM_BOT_TOKEN)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(15)
+        .pool_timeout(10)
+        .get_updates_read_timeout(15)
+        .get_updates_write_timeout(15)
+        .get_updates_connect_timeout(15)
+        .build()
+    )
 
     # Log de TODO update entrante (diagnostico: saber que le llega al bot)
     from telegram.ext import TypeHandler
