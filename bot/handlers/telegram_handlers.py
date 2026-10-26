@@ -527,13 +527,26 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         return
     
-    # Mensaje de procesando
-    status_msg = await message.reply_text("📥 Descargando archivo...")
-    
+    # Mensaje de procesando (best-effort: si Telegram tarda, NO abortar el documento)
+    try:
+        status_msg = await message.reply_text("📥 Descargando archivo...")
+    except Exception as e:
+        logger.warning(f"No se pudo enviar mensaje de estado inicial: {e}")
+        status_msg = None
+
     # LOG: Capturar thread_id para debugging
     thread_id = message.message_thread_id
     logger.info(f"Received document in chat {update.effective_chat.id}, thread_id: {thread_id}")
-    
+
+    async def _estado(texto: str):
+        """Editar el mensaje de estado sin que un fallo mate el flujo."""
+        if status_msg is None:
+            return
+        try:
+            await status_msg.edit_text(texto)
+        except Exception as e:
+            logger.warning(f"edit_text de estado fallo (no aborto): {e}")
+
     try:
         # Descargar archivo
         file = await context.bot.get_file(file_id)
@@ -546,39 +559,39 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             temp_path = tmp.name
         
         await file.download_to_drive(temp_path)
-        
-        await status_msg.edit_text("🔍 Procesando con Vision API (puede tardar 1-3 min en CPU)...")
-        
+
+        await _estado("🔍 Procesando con Vision API (puede tardar 1-3 min en CPU)...")
+
         # Procesar con Vision OCR - con callback de progreso
         import asyncio
-        
+
         # Crear task para el OCR
         ocr_task = asyncio.create_task(process_document_vision(temp_path, mime_type))
-        
+
         # Mostrar progreso cada 30 segundos
         progress_dots = 0
         while not ocr_task.done():
             await asyncio.sleep(30)
             progress_dots = (progress_dots + 1) % 4
             dots = "." * progress_dots
-            await status_msg.edit_text(f"🔍 Procesando con Vision API{dots} (CPU only, puede tardar varios minutos)")
-        
+            await _estado(f"🔍 Procesando con Vision API{dots} (CPU only, puede tardar varios minutos)")
+
         result = await ocr_task
-        
+
         # Limpiar archivo temporal
         try:
             os.unlink(temp_path)
         except:
             pass
-        
+
         if not result["success"]:
-            await status_msg.edit_text(
+            await _estado(
                 f"❌ **Error procesando documento**\n\n"
                 f"{result.get('error', 'Error desconocido')}\n\n"
                 f"Por favor, envíe una foto más nítida del documento completo."
             )
             return
-        
+
         # Guardar en contexto para validación
         import hashlib
         doc_key = hashlib.md5(f"{file_id}_{update.effective_user.id}".encode()).hexdigest()[:16]
@@ -589,23 +602,49 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ocr_data": result["data"],
             "chat_id": update.effective_chat.id,
             "user_id": update.effective_user.id,
-            "message_id": status_msg.message_id,
+            "message_id": status_msg.message_id if status_msg else None,
             "created_at": datetime.utcnow().isoformat(),
         }
-        
-        # Mostrar preview con botones
+
+        # Mostrar preview con botones (aqui SI importa que llegue: reintentos)
         preview_text = format_ocr_preview(result["data"], result["confidence"])
         keyboard = get_validation_keyboard(doc_key)
-        
-        await status_msg.edit_text(
-            preview_text,
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
-        
+
+        if status_msg is not None:
+            for intento in range(3):
+                try:
+                    await status_msg.edit_text(
+                        preview_text,
+                        reply_markup=keyboard,
+                        parse_mode="Markdown"
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(f"edit_text del preview fallo (intento {intento + 1}/3): {e}")
+                    await asyncio.sleep(3)
+            else:
+                # El preview no se pudo editar: avisar en mensaje nuevo
+                logger.error("No se pudo mostrar el preview; el documento SI fue procesado")
+                try:
+                    await message.reply_text(
+                        f"✅ Documento procesado (correlativo detectado: {result['data'].get('correlativo', '?')}).\n"
+                        f"⚠️ No se pudo mostrar el menú de validación: responde a ESTE mensaje con 'ok' para aprobarlo.",
+                    )
+                except Exception:
+                    pass
+        else:
+            try:
+                await message.reply_text(
+                    preview_text,
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"No se pudo enviar el preview en mensaje nuevo: {e}")
+
     except Exception as e:
         logger.error(f"Error en handle_document: {e}")
-        await status_msg.edit_text(f"❌ Error procesando documento: {e}")
+        await _estado(f"❌ Error procesando documento: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────
