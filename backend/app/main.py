@@ -556,10 +556,31 @@ async def list_documentos(
         elif fecha_hasta:
             params.append(("fecha_documento", f"lte.{fecha_hasta}"))
         
+        # Para paginación: obtener total count (sin limit/offset)
+        # Hacer query de count con los mismos filtros
+        count_params = [p for p in params if p[0] not in ("limit", "offset", "select", "order")]
+        count_params.append(("select", "count"))
+        count_result = await client.get("/rest/v1/documentos", params=count_params)
+        count_result.raise_for_status()
+        # La respuesta con select=count devuelve [{"count": N}]
+        try:
+            total_count = count_result.json()[0]["count"]
+        except (IndexError, KeyError, TypeError):
+            total_count = 0
+
         result = await client.get("/rest/v1/documentos", params=params)
         result.raise_for_status()
         data = result.json()
-        return [DocumentoResponse(**doc) for doc in data]
+        
+        # Devolver headers con total count para paginación en frontend
+        from fastapi import Response
+        # No podemos usar Response directamente aquí, pero podemos usar headers en la respuesta
+        # Mejor: usar un header personalizado
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            content=[DocumentoResponse(**doc).model_dump() for doc in data],
+            headers={"X-Total-Count": str(total_count)}
+        )
     except httpx.HTTPStatusError as e:
         logger.error("list_documentos_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))

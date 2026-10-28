@@ -41,6 +41,7 @@ export function DocumentosPage() {
   const [fechaDesde, setFechaDesde] = useState('')
   const [fechaHasta, setFechaHasta] = useState('')
   const [showFilters, setShowFilters] = useState(false)
+  const [showModal, setShowModal] = useState(false)
   const [exportando, setExportando] = useState(false)
   const [selectedDoc, setSelectedDoc] = useState<Documento | null>(null)
   const [editingDoc, setEditingDoc] = useState<Documento | null>(null)
@@ -105,8 +106,14 @@ export function DocumentosPage() {
       if (fechaHasta) params.append('fecha_hasta', fechaHasta)
       
       const resp = await api.get(`/documentos?${params}`)
-      return resp.data
+      // Guardar el total count en un ref global o usar response headers
+      // Para useQuery, necesitamos devolver un objeto con data y totalCount
+      return {
+        data: resp.data,
+        totalCount: parseInt(resp.headers?.['x-total-count'] || '0', 10)
+      }
     },
+    select: (result) => result.data,
     placeholderData: (previousData) => previousData,
   })
 
@@ -116,6 +123,28 @@ export function DocumentosPage() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['documentos'] })
+    },
+  })
+
+  const createMutation = useMutation({
+    mutationFn: async (doc: Partial<Documento>) => {
+      console.log('createMutation mutationFn called', doc)
+      const resp = await api.post('/documentos', doc)
+      console.log('createMutation response', resp.data)
+      return resp.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['documentos'] })
+      setShowModal(false)
+      resetForm()
+    },
+    onError: (error: any) => {
+      console.error('createMutation error', error)
+      console.error('error.response:', error.response)
+      console.error('error.response.data:', error.response?.data)
+      console.error('error.response.status:', error.response?.status)
+      console.error('error.config:', error.config)
+      console.error('error.config.data:', error.config?.data)
     },
   })
 
@@ -200,11 +229,39 @@ export function DocumentosPage() {
     })
   }
 
+  const resetForm = () => {
+    setFormData({
+      correlativo: '',
+      tipo_doc_codigo: '',
+      oficina_origen_sigla: '',
+      oficina_destino_sigla: '',
+      fecha_documento: '',
+      fecha_recepcion: '',
+      remitente: '',
+      destinatario: '',
+      remitente_id: '',
+      destinatario_id: '',
+      asunto: '',
+      folios: 0,
+      observaciones: '',
+      prioridad: 'NORMAL',
+      estado: 'RECIBIDO',
+    })
+    setEditingDoc(null)
+  }
+
+  const openCreate = () => {
+    resetForm()
+    setShowModal(true)
+  }
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     console.log('handleSubmit called', { editingDoc, formData })
     if (editingDoc) {
       updateMutation.mutate({ ...formData, id: editingDoc.id })
+    } else {
+      createMutation.mutate(formData)
     }
   }
 
@@ -230,7 +287,10 @@ export function DocumentosPage() {
   }
 
   const documentos = data || []
-  const totalPages = Math.ceil((data?.length || 0) / pageSize)
+  // Obtener totalCount del cache de la query
+  const queryData = queryClient.getQueryData(['documentos', page, pageSize, debouncedSearch, estadoFiltro, tipoFiltro, oficinaOrigenFiltro, oficinaDestinoFiltro, fechaDesde, fechaHasta])
+  const totalCount = (queryData as { data: any[], totalCount: number } | undefined)?.totalCount || 0
+  const totalPages = totalCount > 0 ? Math.ceil(totalCount / pageSize) : 1
 
   return (
     <div className="space-y-6 bg-page">
@@ -249,7 +309,7 @@ export function DocumentosPage() {
             {exportando ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
             {exportando ? 'Exportando...' : 'Exportar'}
           </button>
-          <button className="btn-primary flex items-center gap-2">
+          <button onClick={openCreate} className="btn-primary flex items-center gap-2">
             <Plus className="w-4 h-4" />
             Nuevo Documento
           </button>
@@ -454,7 +514,7 @@ export function DocumentosPage() {
         {documentos.length > 0 && (
           <div className="p-4 border-t border-default flex items-center justify-between">
             <p className="text-sm text-muted">
-              Mostrando {page * pageSize + 1} - {Math.min((page + 1) * pageSize, documentos.length)} de {documentos.length}
+              Mostrando {page * pageSize + 1} - {Math.min((page + 1) * pageSize, totalCount)} de {totalCount}
             </p>
             <div className="flex items-center gap-2">
               <button
@@ -516,14 +576,16 @@ export function DocumentosPage() {
         </div>
       )}
 
-      {/* Modal Editar */}
-      {editingDoc && (
+      {/* Modal Crear/Editar */}
+      {(editingDoc || showModal) && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
           <div className="bg-card rounded-xl shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
             <div className="p-6 border-b border-default">
               <div className="flex items-center justify-between mb-4">
-                <h2 className="text-xl font-semibold text-heading">Editar Documento</h2>
-                <button onClick={closeModals} className="text-muted hover:text-heading">
+                <h2 className="text-xl font-semibold text-heading">
+                  {editingDoc ? 'Editar Documento' : 'Nuevo Documento'}
+                </h2>
+                <button onClick={() => { setShowModal(false); resetForm(); }} className="text-muted hover:text-heading">
                   <XCircle className="w-5 h-5" />
                 </button>
               </div>
@@ -671,23 +733,23 @@ export function DocumentosPage() {
               <div className="flex gap-2 pt-4 border-t border-default">
                 <button
                   type="button"
-                  onClick={closeModals}
+                  onClick={() => { setShowModal(false); resetForm(); }}
                   className="btn-secondary flex-1"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  disabled={updateMutation.isPending}
+                  disabled={createMutation.isPending || updateMutation.isPending}
                   className="btn-primary flex-1"
                 >
-                  {updateMutation.isPending ? (
+                  {(createMutation.isPending || updateMutation.isPending) ? (
                     <span className="flex items-center justify-center gap-2">
                       <Loader2Icon className="w-4 h-4 animate-spin" />
-                      Guardando...
+                      {editingDoc ? 'Actualizando...' : 'Creando...'}
                     </span>
                   ) : (
-                    'Guardar Cambios'
+                    editingDoc ? 'Guardar Cambios' : 'Crear Documento'
                   )}
                 </button>
               </div>
