@@ -273,16 +273,26 @@ export function DocumentosPage() {
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
               <div>
                 <label className="label">Buscar</label>
-                <input
-                  type="text"
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') setDebouncedSearch(search)
-                  }}
-                  className="input w-full"
-                  placeholder="Correlativo, asunto, remitente... (busca al escribir, ignora acentos)"
-                />
+                <div className="flex gap-1">
+                  <input
+                    type="text"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') setDebouncedSearch(search)
+                    }}
+                    className="input flex-1"
+                    placeholder="Correlativo, asunto, remitente... (busca al escribir, ignora acentos)"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setDebouncedSearch(search)}
+                    className="btn-secondary flex items-center justify-center px-3"
+                    aria-label="Buscar"
+                  >
+                    <Search className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
               <div>
                 <label className="label">Estado</label>

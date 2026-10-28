@@ -531,94 +531,144 @@ function ServiceStatus({ name, status, url }: any) {
 }
 
 function BackupSettings() {
-  const [lastBackup, setLastBackup] = useState<string | null>(null)
+  const queryClient = useQueryClient()
   const [running, setRunning] = useState(false)
+  const [resultado, setResultado] = useState<string | null>(null)
+  const [errorBk, setErrorBk] = useState<string | null>(null)
 
-  const handleBackup = async () => {
-    setRunning(true)
-    // Simular backup
-    await new Promise(r => setTimeout(r, 2000))
-    setLastBackup(new Date().toISOString())
-    setRunning(false)
-    alert('Backup completado exitosamente')
+  const { data: backupsData, isLoading, error, refetch } = useQuery({
+    queryKey: ['backups'],
+    queryFn: async () => {
+      const resp = await api.get('/backup/listar')
+      return resp.data as { backups: Array<{ nombre: string; tamano_bytes: number; fecha: string }>; directorio: string }
+    },
+  })
+
+  const ejecutarBackup = useMutation({
+    mutationFn: async () => {
+      const resp = await api.post('/backup/ejecutar')
+      return resp.data as { ok: boolean; generados: string[]; salida: string }
+    },
+    onSuccess: (data) => {
+      setResultado(`✅ Backup completado: ${data.generados.length} archivo(s) generado(s)`)
+      setErrorBk(null)
+      queryClient.invalidateQueries({ queryKey: ['backups'] })
+    },
+    onError: (err: any) => {
+      setErrorBk(err?.response?.data?.detail || err?.message || 'Error desconocido')
+      setResultado(null)
+    },
+  })
+
+  const formatearTamano = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} B`
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
   }
 
-  const handleRestore = () => {
-    alert('Función de restauración - Seleccionar archivo de backup')
+  const formatearFechaBk = (iso: string) => {
+    try {
+      const d = new Date(iso)
+      return d.toLocaleString('es-VE', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+    } catch {
+      return iso
+    }
   }
+
+  const backups = backupsData?.backups || []
+  const ultimoSql = backups.find(b => b.nombre.endsWith('.sql.gz'))
 
   return (
     <div className="max-w-2xl space-y-6">
       <div className="flex items-center justify-between">
         <h3 className="text-lg font-semibold text-heading">Gestión de Backups</h3>
         <button
-          onClick={handleBackup}
-          disabled={running}
+          onClick={() => ejecutarBackup.mutate()}
+          disabled={ejecutarBackup.isPending}
           className="btn-primary flex items-center gap-2"
         >
-          {running ? (
+          {ejecutarBackup.isPending ? (
             <Loader2 className="w-4 h-4 animate-spin" />
           ) : (
             <Database className="w-4 h-4" />
           )}
-          {running ? 'Ejecutando...' : 'Ejecutar Backup Ahora'}
+          {ejecutarBackup.isPending ? 'Ejecutando...' : 'Ejecutar Backup Ahora'}
         </button>
       </div>
 
+      {(resultado || errorBk) && (
+        <div className={`card p-4 ${errorBk ? 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400' : 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400'}`}>
+          {errorBk || resultado}
+        </div>
+      )}
+
       <div className="card p-6">
-        <h4 className="font-medium text-heading mb-4">Último Backup</h4>
-        {lastBackup ? (
+        <div className="flex items-center justify-between mb-4">
+          <h4 className="font-medium text-heading">Respaldo más reciente</h4>
+          <button onClick={() => refetch()} className="text-sm text-muted hover:text-heading">
+            Actualizar
+          </button>
+        </div>
+        {isLoading ? (
+          <p className="text-muted">Cargando…</p>
+        ) : error ? (
+          <p className="text-red-600 dark:text-red-400">Error: {(error as Error).message}</p>
+        ) : ultimoSql ? (
           <div className="flex items-center justify-between">
             <div>
-              <p className="font-mono text-heading">{format(new Date(lastBackup), 'dd/MM/yyyy HH:mm:ss', { locale: es })}</p>
-              <p className="text-sm text-muted">Backup completo (BD + volúmenes + config)</p>
+              <p className="font-mono text-heading text-sm">{ultimoSql.nombre}</p>
+              <p className="text-sm text-muted">
+                {formatearFechaBk(ultimoSql.fecha)} · {formatearTamano(ultimoSql.tamano_bytes)}
+              </p>
             </div>
-            <span className="badge badge-success">Completado</span>
+            <span className="badge badge-success">Disponible</span>
           </div>
         ) : (
-          <p className="text-muted">No hay backups registrados</p>
+          <p className="text-muted">No hay respaldos registrados aún</p>
         )}
       </div>
 
-      <div className="card p-6 border-border bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800">
-        <h4 className="font-medium text-red-900 dark:text-red-300 mb-2 flex items-center gap-2">
-          <AlertCircle className="w-5 h-5" />
-          Restauración
-        </h4>
-        <p className="text-sm text-red-700 dark:text-red-400 mb-4">
-          La restauración sobrescribe la base de datos actual. Use con precaución.
+      <div className="card p-6">
+        <h4 className="font-medium text-heading mb-4">Historial de respaldos ({backups.length})</h4>
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr className="border-b border-default">
+                <th className="px-2 py-2 text-left text-xs font-medium text-muted uppercase">Archivo</th>
+                <th className="px-2 py-2 text-left text-xs font-medium text-muted uppercase">Fecha</th>
+                <th className="px-2 py-2 text-left text-xs font-medium text-muted uppercase">Tamaño</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-default">
+              {backups.map((b) => (
+                <tr key={b.nombre}>
+                  <td className="px-2 py-2 font-mono text-xs">{b.nombre}</td>
+                  <td className="px-2 py-2 text-xs text-muted">{formatearFechaBk(b.fecha)}</td>
+                  <td className="px-2 py-2 text-xs text-muted">{formatearTamano(b.tamano_bytes)}</td>
+                </tr>
+              ))}
+              {!backups.length && (
+                <tr>
+                  <td colSpan={3} className="px-2 py-6 text-center text-muted text-sm">
+                    Sin respaldos
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <p className="text-xs text-muted mt-3">
+          Directorio en el servidor: <code>{backupsData?.directorio}</code>
         </p>
-        <button
-          onClick={handleRestore}
-          className="btn-danger flex items-center gap-2"
-        >
-          <Database className="w-4 h-4" />
-          Restaurar desde Archivo
-        </button>
       </div>
 
-      <div className="card p-6">
-        <h4 className="font-medium text-heading mb-4">Configuración de Backup Automático</h4>
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <div>
-            <label className="label">Programación (Cron)</label>
-            <input value="0 2 * * *" className="input font-mono" readOnly />
-            <p className="text-sm text-muted mt-1">Diario a las 02:00 AM</p>
-          </div>
-          <div>
-            <label className="label">Retención</label>
-            <input value="30 días" className="input" readOnly />
-            <p className="text-sm text-muted mt-1">Se eliminan backups mayores a 30 días</p>
-          </div>
-          <div>
-            <label className="label">Ubicación</label>
-            <input value="./backups (volumen Docker)" className="input" readOnly />
-          </div>
-          <div>
-            <label className="label">Formato</label>
-            <input value="SQL comprimido (.sql.gz) + volúmenes (.tar.gz)" className="input" readOnly />
-          </div>
-        </div>
+      <div className="card p-6 border-border bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800">
+        <h4 className="font-medium text-blue-900 dark:text-blue-300 mb-2">Backup automático</h4>
+        <p className="text-sm text-blue-700 dark:text-blue-400">
+          El sistema ejecuta un respaldo completo <strong>diario a las 02:00 AM</strong> (cron del
+          servidor) y conserva los últimos <strong>30 días</strong>. El botón de arriba ejecuta el
+          mismo procedimiento bajo demanda.
+        </p>
       </div>
     </div>
   )

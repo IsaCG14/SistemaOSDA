@@ -354,6 +354,9 @@ services:
       - SUPABASE_DB_PASSWORD=${SUPABASE_DB_PASSWORD}
     volumes:
       - ./backend/app:/app/app:ro
+      - ./backups:/backups
+      - ./scripts:/scripts:ro
+      - ./logs:/logs
     depends_on:
       supabase-kong:
         condition: service_healthy

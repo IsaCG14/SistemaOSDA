@@ -4,6 +4,7 @@ Main entry point for the Office Secretary Document Agent API.
 """
 from contextlib import asynccontextmanager
 from typing import Optional, Dict
+from datetime import datetime
 import os
 import logging
 import httpx
@@ -967,6 +968,82 @@ async def create_usuario(nuevo: UsuarioCreate, request: Request):
         raise
     except Exception as e:
         logger.error("create_usuario_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINTS - BACKUP (ejecutar scripts/backup.sh y listar respaldos)
+# ─────────────────────────────────────────────────────────────────
+
+BACKUP_DIR = os.getenv("BACKUP_DIR", "/backups")
+BACKUP_SCRIPT = os.getenv("BACKUP_SCRIPT", "/scripts/backup.sh")
+
+
+@app.get("/api/backup/listar")
+async def listar_backups(request: Request):
+    """Listar respaldos existentes con tamaño y fecha (solo ADMIN)."""
+    if _caller_role(request) != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede ver los respaldos")
+    try:
+        archivos = []
+        for nombre in os.listdir(BACKUP_DIR):
+            ruta = os.path.join(BACKUP_DIR, nombre)
+            if os.path.isfile(ruta) and nombre != ".gitkeep":
+                st = os.stat(ruta)
+                archivos.append({
+                    "nombre": nombre,
+                    "tamano_bytes": st.st_size,
+                    "fecha": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z",
+                })
+        archivos.sort(key=lambda a: a["fecha"], reverse=True)
+        return {"backups": archivos, "directorio": BACKUP_DIR}
+    except FileNotFoundError:
+        return {"backups": [], "directorio": BACKUP_DIR}
+    except Exception as e:
+        logger.error("listar_backups_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/backup/ejecutar")
+async def ejecutar_backup(request: Request):
+    """Ejecutar backup AHORA (solo ADMIN). Corre el mismo script del cron.
+
+    El endpoint responde cuando termina (el dump completo tarda segundos),
+    con un resumen de lo generado.
+    """
+    import subprocess
+    import asyncio as _asyncio
+    if _caller_role(request) != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede ejecutar respaldos")
+    if not os.path.exists(BACKUP_SCRIPT):
+        raise HTTPException(status_code=500, detail="Script de backup no encontrado en el backend")
+    try:
+        antes = set(os.listdir(BACKUP_DIR)) if os.path.isdir(BACKUP_DIR) else set()
+        # Ejecutar SIN bloquear el event loop de la API
+        proc = await _asyncio.create_subprocess_exec(
+            "bash", BACKUP_SCRIPT,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.STDOUT,
+        )
+        try:
+            salida, _ = await _asyncio.wait_for(proc.communicate(), timeout=300)
+        except _asyncio.TimeoutError:
+            proc.kill()
+            raise HTTPException(status_code=500, detail="El backup excedió 5 minutos; revisar logs/backup.log")
+        if proc.returncode != 0:
+            logger.error("backup_ejecutar_failed", rc=proc.returncode, salida=salida.decode()[-500:])
+            raise HTTPException(status_code=500, detail="El backup falló; ver logs/backup.log")
+        despues = set(os.listdir(BACKUP_DIR))
+        nuevos = sorted(despues - antes)
+        return {
+            "ok": True,
+            "generados": nuevos,
+            "salida": salida.decode()[-2000:],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("backup_ejecutar_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
