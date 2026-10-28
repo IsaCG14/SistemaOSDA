@@ -535,6 +535,10 @@ function BackupSettings() {
   const [running, setRunning] = useState(false)
   const [resultado, setResultado] = useState<string | null>(null)
   const [errorBk, setErrorBk] = useState<string | null>(null)
+  // Restore dialog state
+  const [showRestoreDialog, setShowRestoreDialog] = useState(false)
+  const [selectedBackup, setSelectedBackup] = useState<string>('')
+  const [confirmText, setConfirmText] = useState('')
 
   const { data: backupsData, isLoading, error, refetch } = useQuery({
     queryKey: ['backups'],
@@ -560,6 +564,25 @@ function BackupSettings() {
     },
   })
 
+  const restaurarBackup = useMutation({
+    mutationFn: async (archivo: string) => {
+      const resp = await api.post('/backup/restaurar', { archivo, confirmar: 'RESTAURAR' })
+      return resp.data as { ok: boolean; archivo: string; mensaje: string; salida: string }
+    },
+    onSuccess: (data) => {
+      setResultado(`✅ ${data.mensaje}: ${data.archivo}`)
+      setErrorBk(null)
+      setShowRestoreDialog(false)
+      setSelectedBackup('')
+      setConfirmText('')
+      queryClient.invalidateQueries({ queryKey: ['backups'] })
+    },
+    onError: (err: any) => {
+      setErrorBk(err?.response?.data?.detail || err?.message || 'Error desconocido')
+      setResultado(null)
+    },
+  })
+
   const formatearTamano = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -576,7 +599,8 @@ function BackupSettings() {
   }
 
   const backups = backupsData?.backups || []
-  const ultimoSql = backups.find(b => b.nombre.endsWith('.sql.gz'))
+  const sqlBackups = backups.filter(b => b.nombre.endsWith('.sql.gz'))
+  const ultimoSql = sqlBackups[0]
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -637,6 +661,7 @@ function BackupSettings() {
                 <th className="px-2 py-2 text-left text-xs font-medium text-muted uppercase">Archivo</th>
                 <th className="px-2 py-2 text-left text-xs font-medium text-muted uppercase">Fecha</th>
                 <th className="px-2 py-2 text-left text-xs font-medium text-muted uppercase">Tamaño</th>
+                <th className="px-2 py-2 text-left text-xs font-medium text-muted uppercase">Acciones</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-default">
@@ -645,11 +670,26 @@ function BackupSettings() {
                   <td className="px-2 py-2 font-mono text-xs">{b.nombre}</td>
                   <td className="px-2 py-2 text-xs text-muted">{formatearFechaBk(b.fecha)}</td>
                   <td className="px-2 py-2 text-xs text-muted">{formatearTamano(b.tamano_bytes)}</td>
+                  <td className="px-2 py-2">
+                    {(b.nombre.endsWith('.sql.gz') || b.nombre.endsWith('.dump')) && (
+                      <button
+                        onClick={() => {
+                          setSelectedBackup(b.nombre)
+                          setConfirmText('')
+                          setShowRestoreDialog(true)
+                        }}
+                        className="text-blue-600 dark:text-blue-400 hover:underline text-xs"
+                        title="Restaurar este backup"
+                      >
+                        Restaurar
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
               {!backups.length && (
                 <tr>
-                  <td colSpan={3} className="px-2 py-6 text-center text-muted text-sm">
+                  <td colSpan={4} className="px-2 py-6 text-center text-muted text-sm">
                     Sin respaldos
                   </td>
                 </tr>
@@ -670,6 +710,61 @@ function BackupSettings() {
           mismo procedimiento bajo demanda.
         </p>
       </div>
+
+      {/* Modal: Restaurar backup */}
+      {showRestoreDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => { setShowRestoreDialog(false); setSelectedBackup(''); setConfirmText(''); }}>
+          <div className="card w-full max-w-md p-6 space-y-4" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-heading">Restaurar Backup</h3>
+              <button onClick={() => { setShowRestoreDialog(false); setSelectedBackup(''); setConfirmText(''); }} className="text-muted hover:text-heading text-xl leading-none" aria-label="Cerrar">×</button>
+            </div>
+
+            <div className="p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg text-sm text-yellow-800 dark:text-yellow-300">
+              <strong>⚠️ ADVERTENCIA:</strong> Esto SOBRESCRIBE la base de datos actual. Se detendrán los servicios durante la restauración.
+            </div>
+
+            <div>
+              <label className="label">Archivo seleccionado</label>
+              <p className="font-mono text-sm text-heading bg-gray-50 dark:bg-gray-800 p-2 rounded">{selectedBackup}</p>
+            </div>
+
+            <div>
+              <label className="label">Escribe "RESTAURAR" para confirmar</label>
+              <input
+                type="text"
+                value={confirmText}
+                onChange={(e) => setConfirmText(e.target.value)}
+                className="input font-mono"
+                placeholder="RESTAURAR"
+                autoFocus
+              />
+            </div>
+
+            {(errorBk || resultado) && (
+              <div className={`p-3 rounded-lg ${errorBk ? 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400' : 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400'}`}>
+                {errorBk || resultado}
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button onClick={() => { setShowRestoreDialog(false); setSelectedBackup(''); setConfirmText(''); }} className="btn-secondary" disabled={restaurarBackup.isPending}>Cancelar</button>
+              <button
+                onClick={() => {
+                  if (confirmText === 'RESTAURAR' && selectedBackup) {
+                    restaurarBackup.mutate(selectedBackup)
+                  }
+                }}
+                disabled={restaurarBackup.isPending || confirmText !== 'RESTAURAR' || !selectedBackup}
+                className="btn-primary flex items-center gap-2 bg-red-600 hover:bg-red-700"
+              >
+                {restaurarBackup.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
+                {restaurarBackup.isPending ? 'Restaurando...' : 'Confirmar Restauración'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

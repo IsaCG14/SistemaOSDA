@@ -977,6 +977,7 @@ async def create_usuario(nuevo: UsuarioCreate, request: Request):
 
 BACKUP_DIR = os.getenv("BACKUP_DIR", "/backups")
 BACKUP_SCRIPT = os.getenv("BACKUP_SCRIPT", "/scripts/backup.sh")
+RESTORE_SCRIPT = os.getenv("RESTORE_SCRIPT", "/scripts/restore.sh")
 
 
 @app.get("/api/backup/listar")
@@ -1044,6 +1045,160 @@ async def ejecutar_backup(request: Request):
         raise
     except Exception as e:
         logger.error("backup_ejecutar_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/backup/restaurar")
+async def restaurar_backup(request: Request):
+    """Restaurar base de datos desde un backup (solo ADMIN).
+
+    Body JSON: { "archivo": "supabase_20261028_140406.sql.gz", "confirmar": "RESTAURAR" }
+
+    Soporta dos formatos:
+    - .sql.gz (dump plano): usa psql. NO limpia la BD antes (solo inserta).
+    - .dump (custom): usa pg_restore --clean. LIMPIA y recrea la BD completamente (recomendado).
+    """
+    import asyncio as _asyncio
+    if _caller_role(request) != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede restaurar respaldos")
+
+    body = await request.json()
+    archivo = body.get("archivo", "").strip()
+    confirmar = body.get("confirmar", "").strip()
+
+    if not archivo:
+        raise HTTPException(status_code=400, detail="Falta 'archivo' en el body")
+    if confirmar != "RESTAURAR":
+        raise HTTPException(status_code=400, detail="Debe confirmar enviando 'confirmar': 'RESTAURAR'")
+
+    ruta_archivo = os.path.join(BACKUP_DIR, archivo)
+    if not os.path.isfile(ruta_archivo):
+        raise HTTPException(status_code=404, detail=f"Archivo no encontrado: {archivo}")
+
+    es_dump_custom = archivo.endswith(".dump")
+    es_sql_gz = archivo.endswith(".sql.gz")
+
+    if not (es_dump_custom or es_sql_gz):
+        raise HTTPException(status_code=400, detail="Formato no soportado. Use .sql.gz o .dump")
+
+    # Servicios a detener/iniciar
+    servicios = ["backend", "telegram-bot", "graphify", "migrator"]
+
+    # Detectar si estamos en host (docker disponible) o contenedor
+    import shutil
+    docker_disponible = shutil.which("docker") is not None
+
+    try:
+        # 1. Detener servicios que usan la BD (evita conexiones activas durante restore)
+        #    Solo si docker está disponible (entorno host)
+        if docker_disponible:
+            for s in servicios:
+                proc = await _asyncio.create_subprocess_exec(
+                    "docker", "compose", "stop", s,
+                    stdout=_asyncio.subprocess.DEVNULL,
+                    stderr=_asyncio.subprocess.DEVNULL,
+                    cwd="/home/openclaw/office-secretary-document-agent"
+                )
+                await proc.wait()
+
+        # 2. Ejecutar restauración según formato
+        if es_dump_custom:
+            # pg_restore --clean falla por SET transaction_timeout en el dump (PostgreSQL 17+)
+            # Solución: extraer SQL del dump custom, filtrar SET problemáticos, y ejecutar con psql
+            # Nota: stderr de pg_restore (warnings) no debe ir a psql, solo stdout (SQL)
+            if docker_disponible:
+                # Host: pg_restore a SQL limpio (stdout) -> psql en contenedor DB
+                # stderr va a /dev/null para no contaminar el SQL
+                restore_cmd = (
+                    f"docker exec osda-supabase-db pg_restore -U postgres -d postgres "
+                    f"--clean --if-exists --no-owner --no-privileges --no-tablespaces "
+                    f"--no-security-labels --no-comments {ruta_archivo} 2>/dev/null | "
+                    f"grep -v '^SET transaction_timeout' | "
+                    f"docker exec -i osda-supabase-db psql -U postgres -d postgres"
+                )
+                proc = await _asyncio.create_subprocess_shell(
+                    restore_cmd,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.STDOUT,
+                    cwd="/home/openclaw/office-secretary-document-agent"
+                )
+            else:
+                # Contenedor: pg_restore a SQL limpio (stdout) -> psql directo
+                restore_cmd = (
+                    f"PGPASSWORD=\"$SUPABASE_DB_PASSWORD\" pg_restore -h supabase-db -U postgres -d postgres "
+                    f"--clean --if-exists --no-owner --no-privileges --no-tablespaces "
+                    f"--no-security-labels --no-comments {ruta_archivo} 2>/dev/null | "
+                    f"grep -v '^SET transaction_timeout' | "
+                    f"PGPASSWORD=\"$SUPABASE_DB_PASSWORD\" psql -h supabase-db -U postgres -d postgres"
+                )
+                proc = await _asyncio.create_subprocess_shell(
+                    restore_cmd,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.STDOUT,
+                )
+        else:
+            # .sql.gz: psql (no limpia, solo inserta - puede fallar por duplicados)
+            if docker_disponible:
+                restore_cmd = f"gunzip -c {ruta_archivo} | docker exec -i osda-supabase-db psql -U postgres -d postgres"
+                proc = await _asyncio.create_subprocess_shell(
+                    restore_cmd,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.STDOUT,
+                    cwd="/home/openclaw/office-secretary-document-agent"
+                )
+            else:
+                restore_cmd = f"gunzip -c {ruta_archivo} | PGPASSWORD=\"$SUPABASE_DB_PASSWORD\" psql -h supabase-db -U postgres -d postgres"
+                proc = await _asyncio.create_subprocess_shell(
+                    restore_cmd,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.STDOUT,
+                )
+        try:
+            salida, _ = await _asyncio.wait_for(proc.communicate(), timeout=300)
+        except _asyncio.TimeoutError:
+            proc.kill()
+            # Intentar reiniciar servicios aunque falle
+            for s in servicios:
+                await _asyncio.create_subprocess_exec("docker", "compose", "start", s, cwd="/home/openclaw/office-secretary-document-agent")
+            raise HTTPException(status_code=500, detail="La restauración excedió 5 minutos; revisar logs")
+
+        if proc.returncode != 0:
+            logger.error("backup_restaurar_failed", rc=proc.returncode, salida=salida.decode()[-1000:])
+            # Intentar reiniciar servicios solo si docker disponible
+            if docker_disponible:
+                for s in servicios:
+                    await _asyncio.create_subprocess_exec("docker", "compose", "start", s, cwd="/home/openclaw/office-secretary-document-agent")
+            raise HTTPException(status_code=500, detail=f"La restauración falló (código {proc.returncode}); ver salida")
+
+        # 3. Reiniciar servicios (solo si docker disponible)
+        if docker_disponible:
+            for s in servicios:
+                proc = await _asyncio.create_subprocess_exec(
+                    "docker", "compose", "start", s,
+                    stdout=_asyncio.subprocess.DEVNULL,
+                    stderr=_asyncio.subprocess.DEVNULL,
+                    cwd="/home/openclaw/office-secretary-document-agent"
+                )
+                await proc.wait()
+
+        # 4. Esperar un poco y verificar
+        await _asyncio.sleep(5)
+
+        return {
+            "ok": True,
+            "archivo": archivo,
+            "mensaje": "Base de datos restaurada y servicios reiniciados" if docker_disponible else "Base de datos restaurada",
+            "salida": salida.decode()[-2000:],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("backup_restaurar_failed", error=str(e))
+        # Intentar reiniciar servicios en caso de error (solo si docker disponible)
+        if docker_disponible:
+            for s in servicios:
+                await _asyncio.create_subprocess_exec("docker", "compose", "start", s, cwd="/home/openclaw/office-secretary-document-agent")
         raise HTTPException(status_code=500, detail=str(e))
 
 
