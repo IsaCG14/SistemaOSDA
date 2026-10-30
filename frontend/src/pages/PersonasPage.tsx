@@ -56,7 +56,7 @@ export function PersonasPage() {
   const updateMutation = useMutation({
     mutationFn: async (data: Partial<Persona> & { id: string }) => {
       const { id, ...rest } = data
-      const resp = await api.put(`/personas/${id}`, rest)
+      const resp = await api.patch(`/personas/${id}`, rest)
       return resp.data
     },
     onSuccess: () => {

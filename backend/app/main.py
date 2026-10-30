@@ -219,6 +219,7 @@ class DocumentoResponse(DocumentoCreate):
     id: str
     creado_en: str
     actualizado_en: Optional[str] = None
+    creado_por: Optional[str] = None
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -317,10 +318,36 @@ async def health_check():
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/api/documentos", response_model=DocumentoResponse, status_code=201)
-async def create_documento(doc: DocumentoCreate, client: httpx.AsyncClient = Depends(get_supabase_client)):
+async def create_documento(doc: DocumentoCreate, request: Request, client: httpx.AsyncClient = Depends(get_supabase_client)):
     """Crear documento en Supabase e indexar en Graphify."""
     import uuid
     from datetime import datetime
+
+    # Obtener usuario autenticado (sub del JWT)
+    creado_por = None
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if auth and auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        try:
+            from jose import jwt as jose_jwt, JWTError
+            from app.core.config import settings
+            payload = jose_jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+            # El sub es el auth.users.id, necesitamos buscar la persona por email
+            user_email = payload.get("email")
+            if user_email:
+                # Buscar persona por email en la tabla personas
+                persona_result = await client.get(f"/rest/v1/personas?email=eq.{user_email}&select=id")
+                if persona_result.status_code == 200 and persona_result.json():
+                    creado_por = persona_result.json()[0]["id"]
+        except Exception:
+            pass
+
+    # Si viene telegram_user_id del bot, usarlo para buscar persona
+    telegram_user_id = doc.model_dump().get("telegram_user_id")
+    if telegram_user_id and not creado_por:
+        persona_result = await client.get(f"/rest/v1/personas?telegram_user_id=eq.{telegram_user_id}&select=id")
+        if persona_result.status_code == 200 and persona_result.json():
+            creado_por = persona_result.json()[0]["id"]
 
     # Verificar si ya existe el correlativo
     check_result = await client.get(f"/rest/v1/documentos?correlativo=eq.{doc.correlativo}&select=id")
@@ -336,6 +363,7 @@ async def create_documento(doc: DocumentoCreate, client: httpx.AsyncClient = Dep
         "id": doc_id,
         "creado_en": now,
         "actualizado_en": now,
+        "creado_por": creado_por,
     })
 
     try:
@@ -399,7 +427,7 @@ async def get_metricas(
     try:
         # Construir parámetros base
         params = [
-            ("select", "estado,fecha_documento,oficina_origen_sigla,tipo_doc_codigo")
+            ("select", "estado,fecha_documento,oficina_origen_sigla,tipo_doc_codigo,eliminado_en"),
         ]
         
         # Filtros
@@ -415,6 +443,9 @@ async def get_metricas(
             params.append(("fecha_documento", f"gte.{fecha_desde}"))
         elif fecha_hasta:
             params.append(("fecha_documento", f"lte.{fecha_hasta}"))
+        
+        # EXCLUIR documentos eliminados (soft delete)
+        params.append(("eliminado_en", "is.null"))
         
         # Obtener todos los documentos para calcular métricas
         result = await client.get("/rest/v1/documentos", params=params)
@@ -458,6 +489,8 @@ async def get_metricas(
         if tipo_documento:
             params_mes["tipo_doc_codigo"] = f"eq.{tipo_documento}"
         params_mes["fecha_documento"] = f"gte.{inicio_mes}"
+        # EXCLUIR documentos eliminados (soft delete)
+        params_mes["eliminado_en"] = "is.null"
         
         result_mes = await client.get("/rest/v1/documentos", params=params_mes)
         result_mes.raise_for_status()

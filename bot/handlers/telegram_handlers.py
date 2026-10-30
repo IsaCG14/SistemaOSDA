@@ -602,6 +602,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ocr_data": result["data"],
             "chat_id": update.effective_chat.id,
             "user_id": update.effective_user.id,
+            "telegram_user_id": update.effective_user.id,
             "message_id": status_msg.message_id if status_msg else None,
             "created_at": datetime.utcnow().isoformat(),
         }
@@ -720,6 +721,10 @@ async def approve_document(query, pending: dict, doc_key: str, context: ContextT
             "prioridad": "NORMAL",
             "estado": "RECIBIDO",
         }
+        
+        # Agregar telegram_user_id si está disponible en pending
+        if "telegram_user_id" in pending:
+            doc_data["telegram_user_id"] = pending["telegram_user_id"]
         
         headers = {
             "Content-Type": "application/json",

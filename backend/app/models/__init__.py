@@ -171,6 +171,7 @@ class Documento(Base):
     confianza_ocr = Column(Float, nullable=True)
     confirmado_por = Column(UUID(as_uuid=True), ForeignKey("personas.id", ondelete="SET NULL"), nullable=True)
     confirmado_en = Column(DateTime, nullable=True)
+    creado_por = Column(UUID(as_uuid=True), ForeignKey("personas.id", ondelete="SET NULL"), nullable=True)
     eliminado_en = Column(DateTime, nullable=True)  # Soft delete
     creado_en = Column(DateTime, default=datetime.utcnow, nullable=False)
     actualizado_en = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
