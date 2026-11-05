@@ -3,6 +3,7 @@ import { api } from '../api'
 import { useState, useEffect } from 'react'
 import { format } from 'date-fns'
 import { es } from 'date-fns/locale'
+import { useAuth } from '../hooks/useAuth'
 import { 
   Search, Filter, Plus, Download, Edit, Eye, Trash2, 
   Loader2, ChevronLeft, ChevronRight, FileText, Building2,
@@ -29,6 +30,10 @@ const TIPOS_DOCUMENTO = [
 ]
 
 export function DocumentosPage() {
+  const { user } = useAuth()
+  const isAdmin = user?.role === 'ADMIN'
+  const userOficina = user?.oficina_sigla || null
+  
   const queryClient = useQueryClient()
   const [page, setPage] = useState(0)
   const [pageSize, setPageSize] = useState(20)
@@ -36,6 +41,9 @@ export function DocumentosPage() {
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [estadoFiltro, setEstadoFiltro] = useState('')
   const [tipoFiltro, setTipoFiltro] = useState('')
+  
+  // Selector de oficina solo para ADMIN
+  const [oficinaFiltro, setOficinaFiltro] = useState('')
   const [oficinaOrigenFiltro, setOficinaOrigenFiltro] = useState('')
   const [oficinaDestinoFiltro, setOficinaDestinoFiltro] = useState('')
   const [fechaDesde, setFechaDesde] = useState('')
@@ -92,7 +100,7 @@ export function DocumentosPage() {
   })
 
   const { data, isLoading, isFetching, error } = useQuery({
-    queryKey: ['documentos', page, pageSize, debouncedSearch, estadoFiltro, tipoFiltro, oficinaOrigenFiltro, oficinaDestinoFiltro, fechaDesde, fechaHasta],
+    queryKey: ['documentos', page, pageSize, debouncedSearch, estadoFiltro, tipoFiltro, oficinaOrigenFiltro, oficinaDestinoFiltro, fechaDesde, fechaHasta, oficinaFiltro],
     queryFn: async () => {
       const params = new URLSearchParams()
       params.append('limit', pageSize.toString())
@@ -100,8 +108,15 @@ export function DocumentosPage() {
       if (debouncedSearch) params.append('search', debouncedSearch)
       if (estadoFiltro) params.append('estado', estadoFiltro)
       if (tipoFiltro) params.append('tipo_documento', tipoFiltro)
-      if (oficinaOrigenFiltro) params.append('oficina_origen', oficinaOrigenFiltro)
-      if (oficinaDestinoFiltro) params.append('oficina_destino', oficinaDestinoFiltro)
+      
+      // Para ADMIN: usar oficinaFiltro (selector), para SECRETARIO: usar filtros manuales
+      if (isAdmin && oficinaFiltro) {
+        params.append('oficina_origen', oficinaFiltro)
+      } else {
+        if (oficinaOrigenFiltro) params.append('oficina_origen', oficinaOrigenFiltro)
+        if (oficinaDestinoFiltro) params.append('oficina_destino', oficinaDestinoFiltro)
+      }
+      
       if (fechaDesde) params.append('fecha_desde', fechaDesde)
       if (fechaHasta) params.append('fecha_hasta', fechaHasta)
       
@@ -188,8 +203,15 @@ export function DocumentosPage() {
         if (debouncedSearch) params.append('search', debouncedSearch)
         if (estadoFiltro) params.append('estado', estadoFiltro)
         if (tipoFiltro) params.append('tipo_documento', tipoFiltro)
-        if (oficinaOrigenFiltro) params.append('oficina_origen', oficinaOrigenFiltro)
-        if (oficinaDestinoFiltro) params.append('oficina_destino', oficinaDestinoFiltro)
+        
+        // Para ADMIN: usar oficinaFiltro (selector), para SECRETARIO: usar filtros manuales
+        if (isAdmin && oficinaFiltro) {
+          params.append('oficina_origen', oficinaFiltro)
+        } else {
+          if (oficinaOrigenFiltro) params.append('oficina_origen', oficinaOrigenFiltro)
+          if (oficinaDestinoFiltro) params.append('oficina_destino', oficinaDestinoFiltro)
+        }
+        
         if (fechaDesde) params.append('fecha_desde', fechaDesde)
         if (fechaHasta) params.append('fecha_hasta', fechaHasta)
         const resp = await api.get(`/documentos?${params}`)
@@ -380,32 +402,52 @@ export function DocumentosPage() {
                   ))}
                 </select>
               </div>
-              <div>
-                <label className="label">Oficina Origen</label>
-                <select
-                  value={oficinaOrigenFiltro}
-                  onChange={(e) => setOficinaOrigenFiltro(e.target.value)}
-                  className="input"
-                >
-                  <option value="">Todas</option>
-                  {oficinas.map(o => (
-                    <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="label">Oficina Destino</label>
-                <select
-                  value={oficinaDestinoFiltro}
-                  onChange={(e) => setOficinaDestinoFiltro(e.target.value)}
-                  className="input"
-                >
-                  <option value="">Todas</option>
-                  {oficinas.map(o => (
-                    <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
-                  ))}
-                </select>
-              </div>
+              {/* Selector de oficina solo para ADMIN */}
+              {isAdmin && (
+                <div>
+                  <label className="label">Oficina (Filtro General)</label>
+                  <select
+                    value={oficinaFiltro}
+                    onChange={(e) => setOficinaFiltro(e.target.value)}
+                    className="input"
+                  >
+                    <option value="">Todas</option>
+                    {oficinas.map(o => (
+                      <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {!isAdmin && (
+                <>
+                  <div>
+                    <label className="label">Oficina Origen</label>
+                    <select
+                      value={oficinaOrigenFiltro}
+                      onChange={(e) => setOficinaOrigenFiltro(e.target.value)}
+                      className="input"
+                    >
+                      <option value="">Todas</option>
+                      {oficinas.map(o => (
+                        <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="label">Oficina Destino</label>
+                    <select
+                      value={oficinaDestinoFiltro}
+                      onChange={(e) => setOficinaDestinoFiltro(e.target.value)}
+                      className="input"
+                    >
+                      <option value="">Todas</option>
+                      {oficinas.map(o => (
+                        <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
+                      ))}
+                    </select>
+                  </div>
+                </>
+              )}
               <div className="sm:col-span-2 lg:col-span-2 flex gap-4">
                 <div className="flex-1">
                   <label className="label">Fecha desde</label>
@@ -615,14 +657,29 @@ export function DocumentosPage() {
                 </div>
                 <div>
                   <label className="label">Oficina Origen</label>
-                  <input
-                    type="text"
-                    value={formData.oficina_origen_sigla}
-                    onChange={(e) => setFormData({ ...formData, oficina_origen_sigla: e.target.value })}
-                    className="input"
-                    placeholder="OTIC"
-                    required
-                  />
+                  {isAdmin ? (
+                    <input
+                      type="text"
+                      value={formData.oficina_origen_sigla}
+                      onChange={(e) => setFormData({ ...formData, oficina_origen_sigla: e.target.value })}
+                      className="input"
+                      placeholder="OTIC"
+                      required
+                    />
+                  ) : (
+                    <>
+                      <input
+                        type="text"
+                        value={userOficina || formData.oficina_origen_sigla}
+                        onChange={(e) => setFormData({ ...formData, oficina_origen_sigla: e.target.value })}
+                        className="input"
+                        placeholder="OTIC"
+                        required
+                        readOnly
+                      />
+                      <p className="text-xs text-muted mt-1">Tu oficina: {userOficina}</p>
+                    </>
+                  )}
                 </div>
                 <div>
                   <label className="label">Oficina Destino</label>

@@ -1,5 +1,5 @@
-# Caddyfile.dev - Desarrollo Local (HTTP only)
-# Para usar en LAN sin certificados TLS
+# Caddyfile - HTTP Interno Simple (Testing LAN)
+# Dominio: corpocentro.osda.net (resuelve a 192.168.251.203)
 
 {
     admin off
@@ -9,26 +9,74 @@
     }
 }
 
-# Dashboard HTTP (sin TLS)
-http://localhost {
-    reverse_proxy frontend:80
+# Frontend + API + Graphify en HTTP - Acepta múltiples hosts
+http://corpocentro.osda.net, http://localhost, http://127.0.0.1, http://192.168.251.203 {
+    # Auth (Supabase/Kong) - DEBE ir ANTES que /api* general
+    # Quitar prefijo /api antes de enviar a Kong
+    handle /api/auth* {
+        uri strip_prefix /api
+        reverse_proxy supabase-kong:8000
+    }
+
+    # Personas CRUD (PostgREST via Kong) - necesita /rest/v1/
+    handle /api/personas* {
+        uri replace /api/personas /rest/v1/personas
+        reverse_proxy supabase-kong:8000
+    }
+
+    # Frontend (React) - Producción (nginx sirviendo archivos estáticos)
+    # Debe ir ANTES que el catch-all del backend
+    handle /assets* {
+        reverse_proxy osda-frontend:80
+    }
+    handle /fonts* {
+        reverse_proxy osda-frontend:80
+    }
+    handle /favicon.ico {
+        reverse_proxy osda-frontend:80
+    }
+    handle /robots.txt {
+        reverse_proxy osda-frontend:80
+    }
+    handle /manifest.json {
+        reverse_proxy osda-frontend:80
+    }
+
+    # Frontend (React) - Catch-all para SPA routing
+    handle {
+        reverse_proxy osda-frontend:80 {
+            header_up Host {host}
+            header_up X-Real-IP {remote}
+            header_up X-Forwarded-For {remote}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Backend API (FastAPI) - excluye /api/auth y /api/personas
+    handle /api* {
+        reverse_proxy backend:8000
+    }
+
+    # Graphify
+    handle /graphify* {
+        reverse_proxy graphify:8080
+    }
+
+    # Webhook Telegram (para compatibilidad, aunque usemos polling)
+    handle /webhook/telegram* {
+        reverse_proxy backend:8000
+    }
 }
 
-http://0.0.0.0:80 {
-    reverse_proxy frontend:80
-}
-
-# API Backend (interno)
+# Servicios internos (red Docker)
 http://backend:8000 {
     reverse_proxy backend:8000
 }
 
-# Graphify (interno)
 http://graphify:8080 {
     reverse_proxy graphify:8080
 }
 
-# Supabase Kong (interno)
 http://kong:8000 {
     reverse_proxy supabase-kong:8000
 }

@@ -20,6 +20,9 @@ FROM python:3.12-slim as production
 
 WORKDIR /app
 
+# Set PYTHONPATH as ENV so it's available at build and runtime
+ENV PYTHONPATH=/app
+
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \

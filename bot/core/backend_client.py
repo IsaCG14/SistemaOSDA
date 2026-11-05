@@ -118,3 +118,83 @@ def extraer_tipo(args: List[str]) -> Tuple[Optional[str], List[str]]:
     if args and args[-1].upper() in TIPOS_VALIDOS:
         return args[-1].upper(), args[:-1]
     return None, args
+
+
+def extraer_secuencia_correlativo(correlativo: str) -> Optional[int]:
+    """Extraer el número secuencial de un correlativo.
+    
+    Formatos soportados:
+    - OTIC-2026-003 -> 3
+    - OTIC-MEMO-2026-042 -> 42
+    - OTIC-2026-0001 -> 1
+    
+    Returns:
+        El número secuencial como int, o None si no coincide.
+    """
+    if not correlativo:
+        return None
+    # Buscar el último grupo de dígitos al final
+    match = re.search(r'-(\d+)$', correlativo.strip().upper())
+    if match:
+        return int(match.group(1))
+    return None
+
+
+async def detectar_huecos_correlativo(
+    oficina_sigla: str,
+    tipo_documento: str,
+    client: Optional[httpx.AsyncClient] = None
+) -> Dict[str, Any]:
+    """Detectar huecos en la numeración de correlativos.
+    
+    Args:
+        oficina_sigla: Sigla de la oficina (ej: OTIC)
+        tipo_documento: Tipo de documento (ej: MEMO)
+        client: Cliente HTTP opcional (se crea uno si no se pasa)
+    
+    Returns:
+        Dict con: 
+        - total_registrados
+        - max_secuencia
+        - huecos: lista de números faltantes
+        - correlativos_registrados: lista de correlativos encontrados
+    """
+    docs = await consultar_documentos(
+        tipo_documento=tipo_documento,
+        oficina_origen=oficina_sigla,
+        limit=1000
+    )
+    
+    secuencias = []
+    correlativos_encontrados = []
+    
+    for doc in docs:
+        corr = doc.get("correlativo", "")
+        seq = extraer_secuencia_correlativo(corr)
+        if seq is not None:
+            secuencias.append(seq)
+            correlativos_encontrados.append(corr)
+    
+    if not secuencias:
+        return {
+            "oficina": oficina_sigla,
+            "tipo": tipo_documento,
+            "total_registrados": 0,
+            "max_secuencia": 0,
+            "huecos": [],
+            "correlativos_registrados": []
+        }
+    
+    max_seq = max(secuencias)
+    secuencia_completa = set(range(1, max_seq + 1))
+    secuencias_set = set(secuencias)
+    huecos = sorted(secuencia_completa - secuencias_set)
+    
+    return {
+        "oficina": oficina_sigla,
+        "tipo": tipo_documento,
+        "total_registrados": len(secuencias),
+        "max_secuencia": max_seq,
+        "huecos": huecos,
+        "correlativos_registrados": sorted(correlativos_encontrados)
+    }

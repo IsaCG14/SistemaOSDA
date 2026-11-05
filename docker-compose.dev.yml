@@ -59,6 +59,7 @@ services:
     environment:
       - ENVIRONMENT=development
       - LOG_LEVEL=DEBUG
+      - PYTHONPATH=/app
     command: python -m bot.main --polling
 
   frontend:
@@ -69,6 +70,7 @@ services:
       - ./frontend/public:/app/public
       - ./frontend/package.json:/app/package.json
       - ./frontend/vite.config.ts:/app/vite.config.ts
+      - ./frontend/index.html:/app/index.html
     ports:
       - "5173:5173"
     command: npm run dev -- --host 0.0.0.0

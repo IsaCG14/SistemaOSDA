@@ -134,10 +134,18 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if ENVIRONMENT == "development" else ["https://docs.corposcentro.local"],
+    allow_origins=[
+        "http://localhost",
+        "http://localhost:5173",
+        "http://127.0.0.1",
+        "http://127.0.0.1:5173",
+        "http://192.168.251.203",
+        "http://corpocentro.osda.net",
+    ] if ENVIRONMENT == "development" else ["https://docs.corposcentro.local"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Total-Count"],
 )
 
 # ─────────────────────────────────────────────────────────────────
@@ -180,6 +188,74 @@ async def get_graphify_client() -> httpx.AsyncClient:
     if graphify_client is None:
         raise HTTPException(status_code=503, detail="Graphify no disponible")
     return graphify_client
+
+
+async def get_user_office(request: Request) -> Optional[str]:
+    """
+    Retorna oficina_sigla del usuario autenticado.
+    None si es ADMIN (ve todo).
+    """
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        return None
+    
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        from jose import jwt as jose_jwt
+        from app.core.config import settings
+        payload = jose_jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+        user_email = payload.get("email")
+        # El rol ADMIN está en user_metadata.role (no en el claim 'role' estándar de JWT)
+        user_role = payload.get("user_metadata", {}).get("role") or payload.get("role")
+        
+        # ADMIN ve todo
+        if user_role == "ADMIN":
+            return None
+        
+        if user_email:
+            # Buscar persona por email -> oficina_sigla
+            client = supabase_http_client
+            if client:
+                result = await client.get(f"/rest/v1/personas?email=eq.{user_email}&select=oficina_sigla")
+                if result.status_code == 200 and result.json():
+                    return result.json()[0]["oficina_sigla"]
+    except Exception:
+        pass
+    return None
+
+
+async def get_user_office_and_role(request: Request) -> tuple[Optional[str], Optional[str]]:
+    """
+    Retorna (oficina_sigla, role) del usuario autenticado.
+    oficina_sigla = None si es ADMIN.
+    role = 'ADMIN' | 'SECRETARIO' | None
+    """
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        return (None, None)
+    
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        from jose import jwt as jose_jwt
+        from app.core.config import settings
+        payload = jose_jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+        user_email = payload.get("email")
+        user_role = payload.get("user_metadata", {}).get("role") or payload.get("role")
+        
+        # ADMIN ve todo
+        if user_role == "ADMIN":
+            return (None, "ADMIN")
+        
+        if user_email:
+            client = supabase_http_client
+            if client:
+                result = await client.get(f"/rest/v1/personas?email=eq.{user_email}&select=oficina_sigla")
+                if result.status_code == 200 and result.json():
+                    oficina = result.json()[0]["oficina_sigla"]
+                    return (oficina, user_role or "SECRETARIO")
+    except Exception:
+        pass
+    return (None, None)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -318,12 +394,23 @@ async def health_check():
 # ─────────────────────────────────────────────────────────────────
 
 @app.post("/api/documentos", response_model=DocumentoResponse, status_code=201)
-async def create_documento(doc: DocumentoCreate, request: Request, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Crear documento en Supabase e indexar en Graphify."""
+async def create_documento(
+    doc: DocumentoCreate, 
+    request: Request, 
+    user_info: tuple = Depends(get_user_office_and_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client)
+):
+    """Crear documento en Supabase e indexar en Graphify.
+    
+    Para SECRETARIO: oficina_origen_sigla se fuerza a su oficina.
+    Para ADMIN: respeta lo enviado en el payload.
+    """
     import uuid
     from datetime import datetime
-
-    # Obtener usuario autenticado (sub del JWT)
+    
+    user_office, user_role = user_info
+    
+    # Obtener usuario autenticado (creado_por)
     creado_por = None
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     if auth and auth.lower().startswith("bearer "):
@@ -332,10 +419,8 @@ async def create_documento(doc: DocumentoCreate, request: Request, client: httpx
             from jose import jwt as jose_jwt, JWTError
             from app.core.config import settings
             payload = jose_jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-            # El sub es el auth.users.id, necesitamos buscar la persona por email
             user_email = payload.get("email")
             if user_email:
-                # Buscar persona por email en la tabla personas
                 persona_result = await client.get(f"/rest/v1/personas?email=eq.{user_email}&select=id")
                 if persona_result.status_code == 200 and persona_result.json():
                     creado_por = persona_result.json()[0]["id"]
@@ -348,6 +433,16 @@ async def create_documento(doc: DocumentoCreate, request: Request, client: httpx
         persona_result = await client.get(f"/rest/v1/personas?telegram_user_id=eq.{telegram_user_id}&select=id")
         if persona_result.status_code == 200 and persona_result.json():
             creado_por = persona_result.json()[0]["id"]
+
+    # Validar y forzar oficina_origen según rol
+    if user_role == "ADMIN":
+        # ADMIN: respeta lo enviado en el payload
+        pass
+    else:
+        # SECRETARIO: forzar oficina_origen_sigla a su oficina
+        if not user_office:
+            raise HTTPException(status_code=403, detail="Usuario sin oficina asignada")
+        doc.oficina_origen_sigla = user_office
 
     # Verificar si ya existe el correlativo
     check_result = await client.get(f"/rest/v1/documentos?correlativo=eq.{doc.correlativo}&select=id")
@@ -401,7 +496,7 @@ async def create_documento(doc: DocumentoCreate, request: Request, client: httpx
                 await graphify_client.post("/documentos", json=graphify_payload, timeout=10)
         except Exception as e:
             logger.warning("graphify_index_failed", error=str(e), doc_id=doc_id)
-
+        
         return DocumentoResponse(**created[0])
     except httpx.HTTPStatusError as e:
         logger.error("create_documento_failed", error=str(e), response=e.response.text)
@@ -417,22 +512,30 @@ async def create_documento(doc: DocumentoCreate, request: Request, client: httpx
 
 @app.get("/api/documentos/metricas")
 async def get_metricas(
+    request: Request,
     oficina_origen: Optional[str] = None,
     fecha_desde: Optional[str] = None,
     fecha_hasta: Optional[str] = None,
     tipo_documento: Optional[str] = None,
+    user_office: Optional[str] = Depends(get_user_office),
     client: httpx.AsyncClient = Depends(get_supabase_client)
 ):
-    """Obtener métricas para el dashboard."""
+    """Obtener métricas para el dashboard. Filtrado automático por oficina del usuario (SECRETARIO)."""
     try:
         # Construir parámetros base
         params = [
             ("select", "estado,fecha_documento,oficina_origen_sigla,tipo_doc_codigo,eliminado_en"),
         ]
         
-        # Filtros
-        if oficina_origen:
-            params.append(("oficina_origen_sigla", f"eq.{oficina_origen}"))
+        # Filtrado automático por oficina del usuario (SECRETARIO)
+        if user_office:
+            # Filtrar: origen = user_office OR destino = user_office
+            params.append(("or", f"(oficina_origen_sigla.eq.{user_office},oficina_destino_sigla.eq.{user_office})"))
+        else:
+            # ADMIN: aplicar filtros manuales si se proporcionaron
+            if oficina_origen:
+                params.append(("oficina_origen_sigla", f"eq.{oficina_origen}"))
+        
         if tipo_documento:
             params.append(("tipo_doc_codigo", f"eq.{tipo_documento}"))
         if fecha_desde and fecha_hasta:
@@ -483,14 +586,19 @@ async def get_metricas(
         inicio_mes = date(hoy.year, hoy.month, 1).isoformat()
         
         # Crear params frescos para este mes (sin filtros de fecha previos)
-        params_mes = {"select": "id"}
-        if oficina_origen:
-            params_mes["oficina_origen_sigla"] = f"eq.{oficina_origen}"
+        params_mes = [("select", "id")]
+        
+        if user_office:
+            params_mes.append(("or", f"(oficina_origen_sigla.eq.{user_office},oficina_destino_sigla.eq.{user_office})"))
+        elif oficina_origen:
+            params_mes.append(("oficina_origen_sigla", f"eq.{oficina_origen}"))
+        
         if tipo_documento:
-            params_mes["tipo_doc_codigo"] = f"eq.{tipo_documento}"
-        params_mes["fecha_documento"] = f"gte.{inicio_mes}"
+            params_mes.append(("tipo_doc_codigo", f"eq.{tipo_documento}"))
+        
+        params_mes.append(("fecha_documento", f"gte.{inicio_mes}"))
         # EXCLUIR documentos eliminados (soft delete)
-        params_mes["eliminado_en"] = "is.null"
+        params_mes.append(("eliminado_en", "is.null"))
         
         result_mes = await client.get("/rest/v1/documentos", params=params_mes)
         result_mes.raise_for_status()
@@ -519,15 +627,51 @@ async def get_metricas(
 
 
 @app.get("/api/documentos/{doc_id}", response_model=DocumentoResponse)
-async def get_documento(doc_id: str, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Obtener documento por ID."""
+async def get_documento(
+    doc_id: str, 
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client)
+):
+    """Obtener documento por ID. Verifica acceso por oficina."""
+    user_office, user_role = user_info
+    
     try:
         result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}")
         result.raise_for_status()
         data = result.json()
-        if data:
-            return DocumentoResponse(**data[0])
-        raise HTTPException(status_code=404, detail="Documento no encontrado")
+        if not data:
+            raise HTTPException(status_code=404, detail="Documento no encontrado")
+        
+        doc = data[0]
+        
+        # Verificar acceso: ADMIN ve todo, SECRETARIO solo su oficina (origen OR destino)
+        if user_role != "ADMIN":
+            user_office = None
+            auth = request.headers.get("authorization") or request.headers.get("Authorization")
+            if auth and auth.lower().startswith("bearer "):
+                token = auth.split(" ", 1)[1].strip()
+                try:
+                    from jose import jwt as jose_jwt
+                    from app.core.config import settings
+                    payload = jose_jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+                    user_email = payload.get("email")
+                    if user_email:
+                        client_local = supabase_http_client
+                        if client_local:
+                            result = await client_local.get(f"/rest/v1/personas?email=eq.{user_email}&select=oficina_sigla")
+                            if result.status_code == 200 and result.json():
+                                user_office = result.json()[0]["oficina_sigla"]
+                except Exception:
+                    pass
+            
+            if user_office:
+                doc_oficina_origen = doc.get("oficina_origen_sigla")
+                doc_oficina_destino = doc.get("oficina_destino_sigla")
+                if doc_oficina_origen != user_office and doc_oficina_destino != user_office:
+                    raise HTTPException(status_code=403, detail="No tiene acceso a este documento")
+        
+        return DocumentoResponse(**doc)
     except httpx.HTTPStatusError as e:
         logger.error("get_documento_failed", error=str(e), doc_id=doc_id)
         raise HTTPException(status_code=500, detail=str(e))
@@ -538,6 +682,7 @@ async def get_documento(doc_id: str, client: httpx.AsyncClient = Depends(get_sup
 
 @app.get("/api/documentos", response_model=list[DocumentoResponse])
 async def list_documentos(
+    request: Request,
     search: Optional[str] = None,
     oficina_origen: Optional[str] = None,
     oficina_destino: Optional[str] = None,
@@ -547,9 +692,10 @@ async def list_documentos(
     fecha_hasta: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
+    user_office: Optional[str] = Depends(get_user_office),
     client: httpx.AsyncClient = Depends(get_supabase_client)
 ):
-    """Listar documentos con filtros."""
+    """Listar documentos con filtros. Filtrado automático por oficina del usuario (SECRETARIO)."""
     try:
         # Usar lista de tuplas para permitir parámetros duplicados (AND implícito en PostgREST)
         params = [
@@ -558,6 +704,18 @@ async def list_documentos(
             ("limit", str(limit)),
             ("offset", str(offset)),
         ]
+        
+        # Filtrado automático por oficina del usuario (SECRETARIO)
+        # Si user_office existe (no es ADMIN), filtrar: origen = user_office OR destino = user_office
+        if user_office:
+            # PostgREST OR filter: (oficina_origen_sigla.eq.X,oficina_destino_sigla.eq.X)
+            params.append(("or", f"(oficina_origen_sigla.eq.{user_office},oficina_destino_sigla.eq.{user_office})"))
+        else:
+            # ADMIN: aplicar filtros manuales si se proporcionaron
+            if oficina_origen:
+                params.append(("oficina_origen_sigla", f"eq.{oficina_origen}"))
+            if oficina_destino:
+                params.append(("oficina_destino_sigla", f"eq.{oficina_destino}"))
         
         if search:
             # Busqueda sin acentos sobre search_text (columna generada con unaccent)
@@ -623,8 +781,35 @@ async def list_documentos(
 
 
 @app.put("/api/documentos/{doc_id}", response_model=DocumentoResponse)
-async def update_documento(doc_id: str, doc: DocumentoCreate, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Actualizar documento."""
+async def update_documento(
+    doc_id: str, 
+    doc: DocumentoCreate, 
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client)
+):
+    """Actualizar documento. Verifica acceso por oficina."""
+    user_office, user_role = user_info
+    
+    # Verificar acceso primero
+    check_result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}&select=oficina_origen_sigla,oficina_destino_sigla")
+    check_result.raise_for_status()
+    existing = check_result.json()
+    
+    if not existing:
+        raise HTTPException(status_code=404, detail="Documento no encontrado")
+    
+    # Verificar acceso
+    if user_role != "ADMIN":
+        doc_oficina_origen = existing[0].get("oficina_origen_sigla")
+        doc_oficina_destino = existing[0].get("oficina_destino_sigla")
+        if user_office not in (doc_oficina_origen, doc_oficina_destino):
+            raise HTTPException(status_code=403, detail="No tiene acceso a este documento")
+        
+        # SECRETARIO no puede cambiar oficina_origen
+        if doc.oficina_origen_sigla != user_office:
+            raise HTTPException(status_code=403, detail="No puede cambiar la oficina de origen")
+    
     from datetime import datetime
 
     data = doc.model_dump()
@@ -643,7 +828,7 @@ async def update_documento(doc_id: str, doc: DocumentoCreate, client: httpx.Asyn
         data["folios"] = None
     
     data["actualizado_en"] = datetime.utcnow().isoformat()
-
+    
     try:
         result = await client.patch(
             f"/rest/v1/documentos?id=eq.{doc_id}", 
@@ -664,18 +849,33 @@ async def update_documento(doc_id: str, doc: DocumentoCreate, client: httpx.Asyn
 
 
 @app.delete("/api/documentos/{doc_id}")
-async def delete_documento(doc_id: str, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Eliminar documento: si está ARCHIVADO -> borrado permanente, sino -> marcar como ARCHIVADO."""
+async def delete_documento(
+    doc_id: str, 
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client)
+):
+    """Eliminar documento: si está ARCHIVADO -> borrado permanente, sino -> marcar como ARCHIVADO.
+    Verifica acceso por oficina."""
+    user_office, user_role = user_info
+    
     from datetime import datetime
-
+    
     try:
-        # Primero verificar el estado actual del documento
-        check_result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}&select=estado")
+        # Primero verificar el estado actual del documento y oficina
+        check_result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}&select=estado,oficina_origen_sigla,oficina_destino_sigla")
         check_result.raise_for_status()
         existing = check_result.json()
         
         if not existing:
             raise HTTPException(status_code=404, detail="Documento no encontrado")
+        
+        # Verificar acceso
+        if user_role != "ADMIN":
+            doc_oficina_origen = existing[0].get("oficina_origen_sigla")
+            doc_oficina_destino = existing[0].get("oficina_destino_sigla")
+            if user_office not in (doc_oficina_origen, doc_oficina_destino):
+                raise HTTPException(status_code=403, detail="No tiene acceso a este documento")
         
         current_estado = existing[0].get("estado", "")
         
@@ -705,7 +905,7 @@ async def delete_documento(doc_id: str, client: httpx.AsyncClient = Depends(get_
             if result.json():
                 return {"message": "Documento archivado", "id": doc_id}
             raise HTTPException(status_code=404, detail="Documento no encontrado")
-            
+           
     except httpx.HTTPStatusError as e:
         logger.error("delete_documento_failed", error=str(e), response=e.response.text, doc_id=doc_id)
         # Si el error original es 404, propagar como 404
@@ -778,13 +978,26 @@ async def get_pendientes(dias_limite: int = 5, graphify: httpx.AsyncClient = Dep
 
 
 @app.get("/api/consultas/buscar")
-async def buscar_documentos(q: str, graphify: httpx.AsyncClient = Depends(get_graphify_client)):
-    """Buscar documentos en Graphify."""
+async def buscar_documentos(
+    q: str, 
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+    graphify: httpx.AsyncClient = Depends(get_graphify_client)
+):
+    """Buscar documentos en Graphify. Filtrado automático por oficina."""
+    user_office, user_role = user_info
+    
     try:
-        resp = await graphify.get(f"/buscar?q={q}&limit=10")
+        params = {"q": q, "limit": 10}
+        if user_role != "ADMIN" and user_office:
+            params["oficina"] = user_office
+        
+        resp = await graphify.get("/buscar", params=params)
         if resp.status_code == 200:
             return resp.json()
         raise HTTPException(status_code=500, detail="Error en Graphify")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("buscar_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))

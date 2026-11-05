@@ -2,6 +2,7 @@
 Telegram Bot Handlers for document processing workflow.
 """
 import logging
+import re
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -9,8 +10,6 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from bot.core.config import settings, get_settings_instance
-from app.services.vision_ocr import process_document_vision
-from app.services.graphify_client import graphify_client
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +21,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /start - Bienvenida."""
     thread_id = update.message.message_thread_id
     if not is_authorized(update.effective_chat.id, update.effective_user.id, thread_id):
-        await update.message.reply_text("❌ No autorizado. Contacte al administrador.")
-        return
+        return  # Silencioso: no responde en topics no autorizados
     
     welcome = (
         "🤖 **Office Secretary Document Agent**\n\n"
@@ -112,6 +110,9 @@ async def pendientes_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_authorized(update.effective_chat.id, update.effective_user.id, thread_id):
         return
     
+    # Import here to ensure PYTHONPATH is set
+    from app.services.graphify_client import graphify_client
+    
     try:
         docs = await graphify_client.get_pending_documents()
         
@@ -147,6 +148,9 @@ async def correlativo_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     oficina, tipo = args[0].upper(), args[1].upper()
+    
+    # Import here to ensure PYTHONPATH is set
+    from app.services.graphify_client import graphify_client
     
     try:
         result = await graphify_client.get_last_correlativo(oficina, tipo)
@@ -420,7 +424,7 @@ async def estado_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     estado = args[0].upper()
-    await _listar_documentos(update, {"estado": estado}, f"Estado {estado}")
+    await _listar_documentos(update, context, {"estado": estado}, f"Estado {estado}")
 
 
 async def oficina_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -472,6 +476,184 @@ async def resumen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(texto, parse_mode="Markdown")
 
 
+async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /consulta <pregunta> - Consultas en lenguaje natural."""
+    if not is_authorized(update.effective_chat.id, update.effective_user.id, update.message.message_thread_id):
+        return
+    
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: `/consulta <pregunta>`\n"
+            "Ejemplos:\n"
+            "• `/consulta cuantos memos faltan por registrar`\n"
+            "• `/consulta cuantos oficios pendientes en OTIC`\n"
+            "• `/consulta cuantos documentos registró OTIC este mes`\n"
+            "• `/consulta cuantos informes archivados`\n"
+            "• `/consulta cual es el ultimo correlativo de OTIC MEMO`\n",
+            parse_mode="Markdown"
+        )
+        return
+    
+    pregunta = " ".join(args).lower()
+    
+    try:
+        from bot.core.backend_client import consultar_documentos, TIPOS_VALIDOS, ESTADOS_VALIDOS
+        import re
+        from datetime import date
+        
+        # Detectar tipo de consulta
+        tipo = None
+        for t in TIPOS_VALIDOS:
+            if t.lower() in pregunta:
+                tipo = t
+                break
+        
+        estado = None
+        for e in ESTADOS_VALIDOS:
+            if e.lower() in pregunta:
+                estado = e
+                break
+        
+        # Detectar intención de conteo
+        count_keywords = ["cuantos", "cuántos", "cuantas", "cuántas", "total", "numero", "número"]
+        is_count = any(k in pregunta for k in count_keywords)
+        
+        # Detectar filtros temporales
+        fecha_desde = None
+        mes_actual = False
+        if "este mes" in pregunta or "mes actual" in pregunta:
+            hoy = date.today()
+            inicio_mes = date(hoy.year, hoy.month, 1).isoformat()
+            fecha_desde = inicio_mes
+            mes_actual = True
+        
+        # Ejecutar consulta según intención
+        filtros = {}
+        if tipo:
+            filtros["tipo_documento"] = tipo
+        if estado:
+            filtros["estado"] = estado
+        if fecha_desde:
+            filtros["fecha_desde"] = fecha_desde
+        
+        docs = await consultar_documentos(**filtros, limit=1000)
+        
+        if is_count:
+            # Filtrar adicionales en Python para consultas complejas
+            if mes_actual:
+                hoy = date.today()
+                docs = [d for d in docs if d.get("fecha_documento", "").startswith(f"{date.today().year}-{date.today().month:02d}")]
+            
+            respuesta = f"📊 **Consulta: {' '.join(args)}**\n\n"
+            respuesta += f"📊 **Total: {len(docs)}**"
+            if tipo:
+                respuesta += f" {tipo}"
+            if estado:
+                respuesta += f" {estado}"
+            if mes_actual:
+                respuesta += " este mes"
+            respuesta += "\n"
+            
+            # Agregar desglose si hay pocos resultados
+            if len(docs) <= 20:
+                respuesta += "\n*Detalle:*\n"
+                for d in docs[:10]:
+                    respuesta += f"• `{d.get('correlativo', 'N/A')}` - {d.get('asunto', 'Sin asunto')[:50]}\n"
+                if len(docs) > 10:
+                    respuesta += f"... y {len(docs) - 10} más"
+        else:
+            # Consulta de listado
+            await _listar_documentos(update, context, {"tipo_documento": tipo, "estado": estado, "fecha_desde": fecha_desde} if fecha_desde else {"tipo_documento": tipo, "estado": estado} if estado else {"tipo_documento": tipo} if tipo else {}, f"Consulta: {' '.join(args)}")
+            return
+        
+        await update.message.reply_text(respuesta, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Error en consulta_command: {e}")
+        await update.message.reply_text("❌ Error procesando consulta")
+
+
+async def huecos_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /huecos <oficina> <tipo> - Detectar huecos en numeración de correlativos.
+    
+    Ej: /huecos OTIC MEMO
+    Detecta números faltantes en la secuencia (ej: si hay 1,2,4,5 -> falta el 3)
+    """
+    thread_id = update.message.message_thread_id
+    if not is_authorized(update.effective_chat.id, update.effective_user.id, thread_id):
+        return
+    
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Uso: `/huecos <oficina> <tipo>`\n"
+            "Ej: `/huecos OTIC MEMO`\n"
+            "Detecta números faltantes en la secuencia de correlativos.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    oficina, tipo = args[0].upper(), args[1].upper()
+    
+    # Validar tipo
+    from bot.core.backend_client import TIPOS_VALIDOS
+    if tipo not in TIPOS_VALIDOS:
+        await update.message.reply_text(
+            f"❌ Tipo inválido. Tipos válidos: {', '.join(TIPOS_VALIDOS)}",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        from bot.core.backend_client import detectar_huecos_correlativo
+        
+        await update.message.reply_text(f"🔍 Analizando huecos en {oficina} - {tipo}...")
+        
+        resultado = await detectar_huecos_correlativo(oficina, tipo)
+        
+        total = resultado["total_registrados"]
+        max_seq = resultado["max_secuencia"]
+        huecos = resultado["huecos"]
+        correlativos = resultado["correlativos_registrados"]
+        
+        if total == 0:
+            await update.message.reply_text(
+                f"📭 No hay correlativos registrados para {oficina} - {tipo}",
+                parse_mode="Markdown"
+            )
+            return
+        
+        texto = f"🔍 **Análisis de huecos: {oficina} - {tipo}**\n\n"
+        texto += f"📊 Total registrados: **{total}**\n"
+        texto += f"🔢 Secuencia máxima: **{max_seq}**\n\n"
+        
+        if huecos:
+            texto += f"⚠️ **Huecos detectados ({len(huecos)}):**\n"
+            # Mostrar en grupos de 20 para no saturar
+            for i, h in enumerate(huecos):
+                if i < 50:
+                    texto += f"• Falta: **{h}** (correlativo {oficina}-{tipo}-{h:03d})\n"
+                elif i == 50:
+                    texto += f"... y {len(huecos) - 50} huecos más\n"
+                    break
+            texto += f"\n💡 *Total faltantes: {len(huecos)} de {max_seq} esperados*"
+        else:
+            texto += f"✅ **Sin huecos** - Secuencia completa del 1 al {max_seq}\n"
+        
+        # Mostrar últimos 5 correlativos registrados
+        if correlativos:
+            texto += f"\n📋 **Últimos registrados:**\n"
+            for c in correlativos[-5:]:
+                texto += f"• `{c}`\n"
+        
+        await update.message.reply_text(texto, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"Error en huecos_command: {e}")
+        await update.message.reply_text("❌ Error analizando huecos")
+
+
 async def paginacion_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback de botones de paginacion: page:<pagina>:<filtros_key>. (answer ya hecho arriba)"""
     query = update.callback_query
@@ -500,11 +682,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = message.message_thread_id
     
     if not is_authorized(update.effective_chat.id, update.effective_user.id, thread_id):
-        if thread_id:
-            await message.reply_text("❌ Este bot solo procesa documentos en el topic configurado.")
-        else:
-            await message.reply_text("❌ No autorizado o topic incorrecto.")
-        return
+        return  # Silencioso: no responde en topics no autorizados
     
     # Determinar file_id y mime_type
     if message.photo:
@@ -533,7 +711,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"No se pudo enviar mensaje de estado inicial: {e}")
         status_msg = None
-
+    
     # LOG: Capturar thread_id para debugging
     thread_id = message.message_thread_id
     logger.info(f"Received document in chat {update.effective_chat.id}, thread_id: {thread_id}")
@@ -564,7 +742,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Procesar con Vision OCR - con callback de progreso
         import asyncio
-
+        # Import here to ensure PYTHONPATH is set
+        from app.services.vision_ocr import process_document_vision
+        
         # Crear task para el OCR
         ocr_task = asyncio.create_task(process_document_vision(temp_path, mime_type))
 
@@ -939,55 +1119,26 @@ def validate_field(field: str, value: str):
         except ValueError:
             return None
     
-    elif field == "folios":
+    elif field in ["folios"]:
+        # Número entero
         try:
-            n = int(value)
-            if n > 0:
-                return n
-            return None
+            return int(value)
         except ValueError:
             return None
     
-    elif field == "tipo_documento":
-        valid_types = ["MEMO", "OFICIO", "CIRCULAR", "INFORME", "NOTA", "ACTA", "RESOLUCION", "SOLICITUD", "RECIBO", "OTRO"]
-        if value.upper() in valid_types:
-            return value.upper()
-        return None
-    
-    elif field in ["oficina_origen", "oficina_destino"]:
-        # Permitir cualquier código de 2-10 caracteres alfanuméricos mayúsculos
-        # La validación real la hace la BD con foreign key
-        if re.match(r'^[A-Z0-9]{2,10}$', value.upper()):
-            return value.upper()
-        return None
-    
-    # Para texto libre
-    return value if value else None
+    # Para el resto, devolver el valor limpio
+    return value.strip()
 
 
 async def finish_correction(query, pending: dict, doc_key: str, context: ContextTypes.DEFAULT_TYPE):
-    """Terminar corrección y mostrar preview actualizado."""
-    ocr_data = pending["ocr_data"]
+    """Terminar corrección y volver a preview."""
+    # Eliminar flag de corrección
+    context.user_data.pop("awaiting_correction", None)
+    context.user_data.pop(CORRECTION_FIELD, None)
     
-    # Recalcular confianza (simplificado)
-    confidence = 0.9  # Asumimos alta tras corrección manual
-    
-    preview_text = format_ocr_preview(ocr_data, confidence)
-    keyboard = get_validation_keyboard(doc_key)
-    
-    await query.edit_message_text(
-        preview_text + "\n\n✏️ *Correcciones aplicadas*",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-
-
-async def cancel_correction(query, pending: dict, doc_key: str, context: ContextTypes.DEFAULT_TYPE):
-    """Cancelar corrección y volver al preview."""
-    ocr_data = pending["ocr_data"]
-    confidence = pending.get("confidence", 0.5)
-    
-    preview_text = format_ocr_preview(ocr_data, confidence)
+    # Mostrar preview actualizado
+    from bot.handlers.telegram_handlers import format_ocr_preview, get_validation_keyboard
+    preview_text = format_ocr_preview(pending["ocr_data"], pending.get("confidence", 0))
     keyboard = get_validation_keyboard(doc_key)
     
     await query.edit_message_text(
@@ -997,80 +1148,70 @@ async def cancel_correction(query, pending: dict, doc_key: str, context: Context
     )
 
 
-# ─────────────────────────────────────────────────────────────────
-# UTILIDADES
-# ─────────────────────────────────────────────────────────────────
-
-def is_authorized(chat_id: int, user_id: int, message_thread_id: int | None = None) -> bool:
-    """Verificar si el chat/usuario está autorizado y si está en el topic correcto."""
-    settings = get_settings_instance()
-    allowed_chats = settings.TELEGRAM_ALLOWED_CHAT_IDS.split(",")
-    if str(chat_id) in allowed_chats or chat_id in [int(x) for x in allowed_chats if x]:
-        # Si hay topic configurado, verificar que el mensaje venga de ese topic
-        if settings.TELEGRAM_DOCUMENT_TOPIC_ID:
-            topic_id = int(settings.TELEGRAM_DOCUMENT_TOPIC_ID)
-            # Si es un topic (forum), message_thread_id debe coincidir
-            # Si no es topic (chat normal), message_thread_id será None
-            if message_thread_id is not None:
-                return message_thread_id == topic_id
-            else:
-                # Si hay topic configurado pero el mensaje no tiene thread_id, no procesar
-                return False
-        return True
-    return False
+async def cancel_correction(query, pending: dict, doc_key: str, context: ContextTypes.DEFAULT_TYPE):
+    """Cancelar corrección y volver a preview."""
+    # Eliminar flag de corrección
+    context.user_data.pop("awaiting_correction", None)
+    context.user_data.pop(CORRECTION_FIELD, None)
+    
+    # Mostrar preview actualizado
+    from bot.handlers.telegram_handlers import format_ocr_preview, get_validation_keyboard
+    preview_text = format_ocr_preview(pending["ocr_data"], pending.get("confidence", 0))
+    keyboard = get_validation_keyboard(doc_key)
+    
+    await query.edit_message_text(
+        preview_text,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
 
 
-def format_ocr_preview(ocr: dict, confidence: float) -> str:
-    """Formatear vista previa de datos OCR."""
-    lines = ["📄 **Datos extraídos (OCR):**", ""]
-    
-    fields = [
-        ("🔢 Correlativo", ocr.get("correlativo")),
-        ("📅 Fecha documento", ocr.get("fecha_documento")),
-        ("📥 Fecha recepción", ocr.get("fecha_recepcion")),
-        ("👤 Remitente", ocr.get("remitente")),
-        ("👥 Destinatario", ocr.get("destinatario")),
-        ("🏢 Oficina origen", ocr.get("oficina_origen")),
-        ("🏢 Oficina destino", ocr.get("oficina_destino")),
-        ("📋 Tipo", ocr.get("tipo_documento")),
-        ("📝 Asunto", ocr.get("asunto")),
-        ("📄 Folios", str(ocr.get("folios")) if ocr.get("folios") else None),
-        ("📎 Anexos", ", ".join(ocr.get("anexos", [])) if ocr.get("anexos") else None),
-        ("💬 Observaciones", ocr.get("observaciones")),
-    ]
-    
-    for label, value in fields:
-        if value:
-            lines.append(f"{label}: `{value}`")
-        else:
-            lines.append(f"{label}: ❌ *No detectado*")
-    
-    lines.append("")
-    lines.append(f"🎯 **Confianza: {confidence:.0%}**")
-    
-    if confidence >= 0.85:
-        lines.append("✅ *Alta confianza - Listo para aprobar*")
-    elif confidence >= 0.50:
-        lines.append("⚠️ *Confianza media - Revisar campos*")
-    else:
-        lines.append("🔴 *Baja confianza - Requiere corrección manual*")
-    
-    return "\n".join(lines)
+def format_ocr_preview(ocr_data: dict, confidence: float) -> str:
+    """Formatear preview del OCR para validación."""
+    texto = (
+        f"📄 **Validar documento** (confianza: {confidence:.0%})\n\n"
+        f"🔢 Correlativo: `{ocr_data.get('correlativo', 'No detectado')}`\n"
+        f"📋 Tipo: {ocr_data.get('tipo_documento', 'No detectado')}\n"
+        f"🏢 {ocr_data.get('oficina_origen', '?')} → {ocr_data.get('oficina_destino', '?')}\n"
+        f"📅 Fecha: {ocr_data.get('fecha_documento', 'No detectada')} | Rec: {ocr_data.get('fecha_recepcion', 'No detectada')}\n"
+        f"👤 Remitente: {ocr_data.get('remitente', 'No detectado')}\n"
+        f"👥 Destinatario: {ocr_data.get('destinatario', 'No detectado')}\n"
+        f"📝 Asunto: {ocr_data.get('asunto', 'No detectado')}\n"
+        f"📄 Folios: {ocr_data.get('folios', 'No detectado')}\n"
+    )
+    if ocr_data.get("anexos"):
+        texto += f"📎 Anexos: {', '.join(map(str, ocr_data['anexos'][:5]))}\n"
+    if ocr_data.get("observaciones"):
+        texto += f"💬 {(ocr_data['observaciones'] or '')[:200]}\n"
+    return texto
 
 
-def get_validation_keyboard(doc_key: str) -> InlineKeyboardMarkup:
-    """Crear teclado inline para validación."""
+def get_validation_keyboard(doc_key: str):
+    """Teclado inline para validación."""
     keyboard = [
-        [
-            InlineKeyboardButton("✅ Aprobar", callback_data=f"approve:{doc_key}"),
-            InlineKeyboardButton("✏️ Corregir", callback_data=f"correct:{doc_key}"),
-        ],
-        [
-            InlineKeyboardButton("❌ Rechazar", callback_data=f"reject:{doc_key}"),
-        ]
+        [InlineKeyboardButton("✅ Aprobar", callback_data=f"approve:{doc_key}")],
+        [InlineKeyboardButton("✏️ Corregir", callback_data=f"correct:{doc_key}")],
+        [InlineKeyboardButton("❌ Rechazar", callback_data=f"reject:{doc_key}")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-import re
-from datetime import datetime
+def is_authorized(chat_id, user_id, thread_id):
+    """Verificar autorización: solo permitir en el topic/thread configurado."""
+    settings = get_settings_instance()
+    
+    # Si no hay topic ID configurado, permitir todos (compatibilidad)
+    if not settings.TELEGRAM_DOCUMENT_TOPIC_ID:
+        return True
+    
+    # Si no hay thread_id en el mensaje, no autorizar (es un grupo con topics)
+    if thread_id is None:
+        return False
+    
+    # Verificar que el thread_id coincida con el configurado
+    try:
+        allowed_thread_id = int(settings.TELEGRAM_DOCUMENT_TOPIC_ID)
+        return thread_id == allowed_thread_id
+    except (ValueError, TypeError):
+        # Si no es un entero válido, permitir por seguridad
+        return True

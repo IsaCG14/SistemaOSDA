@@ -6,6 +6,7 @@ interface User {
   email: string
   role: 'ADMIN' | 'SECRETARIO'
   nombre: string
+  oficina_sigla: string | null
 }
 
 interface AuthContextType {
@@ -36,7 +37,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const verifyToken = async () => {
     try {
       const response = await api.get('/auth/v1/user')
-      setUser(response.data)
+      const userData = response.data
+      
+      // Si no es ADMIN, buscar oficina
+      let oficina_sigla = null
+      if (userData.role !== 'ADMIN' && userData.email) {
+        const personaResp = await api.get(`/personas?email=eq.${userData.email}&select=oficina_sigla`)
+        if (personaResp.data?.[0]) oficina_sigla = personaResp.data[0].oficina_sigla
+      }
+      
+      setUser({ ...userData, oficina_sigla })
     } catch {
       localStorage.removeItem('access_token')
       delete api.defaults.headers.common['Authorization']
@@ -51,7 +61,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       localStorage.setItem('access_token', access_token)
       api.defaults.headers.common['Authorization'] = `Bearer ${access_token}`
-      setUser(userData)
+      
+      // Si no es ADMIN, buscar oficina
+      let oficina_sigla = null
+      if (userData.role !== 'ADMIN' && userData.email) {
+        const personaResp = await api.get(`/personas?email=eq.${userData.email}&select=oficina_sigla`)
+        if (personaResp.data?.[0]) oficina_sigla = personaResp.data[0].oficina_sigla
+      }
+      
+      setUser({ ...userData, oficina_sigla })
     }
 
   const logout = () => {

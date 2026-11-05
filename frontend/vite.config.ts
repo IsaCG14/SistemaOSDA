@@ -15,6 +15,7 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: 5173,
+    allowedHosts: ['localhost', '127.0.0.1', '192.168.251.203', 'corpocentro.osda.net'],
     proxy: {
       '/api': {
         target: 'http://backend:8000',

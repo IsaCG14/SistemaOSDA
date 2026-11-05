@@ -1,11 +1,17 @@
 """
 Telegram Bot Main Entry Point.
 """
+import sys
+import os
+
+# Ensure /app is FIRST in Python path so 'app' module can be imported
+sys.path.insert(0, '/app')
+
 import argparse
 import asyncio
 import logging
-import sys
 
+# Import telegram modules here to ensure path is set first
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -13,35 +19,9 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    TypeHandler,
 )
 from telegram import Update
-
-from bot.core.config import get_settings_instance
-from bot.handlers.telegram_handlers import (
-    start_command,
-    ayuda_command,
-    oficinas_command,
-    tipos_command,
-    pendientes_command,
-    correlativo_command,
-    buscar_command,
-    handle_document,
-    handle_callback,
-    handle_correction_text,
-    doc_command,
-    documentos_command,
-    fecha_command,
-    estado_command,
-    oficina_command,
-    resumen_command,
-    paginacion_callback,
-    memos_command,
-    notas_command,
-    oficios_command,
-    informes_command,
-    circulares_command,
-    actas_command,
-)
 
 # Configurar logging
 logging.basicConfig(
@@ -51,8 +31,49 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def setup_application(polling: bool = True) -> Application:
+async def setup_application(polling):
     """Configurar y retornar la aplicación de Telegram."""
+    
+    # Import handlers HERE - INSIDE the function body
+    from bot.core.config import get_settings_instance
+    from bot.handlers.telegram_handlers import (
+        start_command,
+        ayuda_command,
+        oficinas_command,
+        tipos_command,
+        pendientes_command,
+        correlativo_command,
+        buscar_command,
+        handle_document,
+        handle_callback,
+        handle_correction_text,
+        doc_command,
+        documentos_command,
+        fecha_command,
+        estado_command,
+        oficina_command,
+        resumen_command,
+        paginacion_callback,
+        memos_command,
+        notas_command,
+        oficios_command,
+        informes_command,
+        circulares_command,
+        actas_command,
+        consulta_command,
+        huecos_command,
+    )
+
+    from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        CallbackQueryHandler,
+        ContextTypes,
+        filters,
+        TypeHandler,
+    )
+    from telegram import Update
     
     if not get_settings_instance().TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN no configurado")
@@ -110,6 +131,8 @@ async def setup_application(polling: bool = True) -> Application:
     application.add_handler(CommandHandler("estado", estado_command))
     application.add_handler(CommandHandler("oficina", oficina_command))
     application.add_handler(CommandHandler("resumen", resumen_command))
+    application.add_handler(CommandHandler("consulta", consulta_command))
+    application.add_handler(CommandHandler("huecos", huecos_command))
     
     # Handler para documentos (fotos y archivos)
     application.add_handler(MessageHandler(
@@ -134,7 +157,7 @@ async def setup_application(polling: bool = True) -> Application:
     return application
 
 
-async def run_polling(app: Application):
+async def run_polling(app):
     """Ejecutar bot en modo long polling."""
     logger.info("Iniciando bot en modo polling...")
     await app.initialize()
@@ -152,10 +175,11 @@ async def run_polling(app: Application):
         await app.shutdown()
 
 
-async def run_webhook(app: Application):
+async def run_webhook(app):
     """Ejecutar bot en modo webhook (para producción)."""
     logger.info("Iniciando bot en modo webhook...")
     
+    from bot.core.config import get_settings_instance
     webhook_url = f"{get_settings_instance().BACKEND_URL}/webhook/telegram"
     
     await app.initialize()
@@ -189,7 +213,7 @@ async def main():
     # Default a polling en desarrollo
     use_polling = args.polling or not args.webhook
     
-    app = await setup_application(polling=use_polling)
+    app = await setup_application(use_polling)
     
     try:
         if use_polling:
