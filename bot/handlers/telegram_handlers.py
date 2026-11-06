@@ -2,6 +2,7 @@
 Telegram Bot Handlers for document processing workflow.
 """
 import logging
+import httpx
 import re
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -480,7 +481,7 @@ async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /consulta <pregunta> - Consultas en lenguaje natural."""
     if not is_authorized(update.effective_chat.id, update.effective_user.id, update.message.message_thread_id):
         return
-    
+
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -494,57 +495,200 @@ async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-    
+
     pregunta = " ".join(args).lower()
-    
+
     try:
         from bot.core.backend_client import consultar_documentos, TIPOS_VALIDOS, ESTADOS_VALIDOS
         import re
+        import calendar
         from datetime import date
-        
-        # Detectar tipo de consulta
+
+        # Detectar tipo de documento
         tipo = None
         for t in TIPOS_VALIDOS:
             if t.lower() in pregunta:
                 tipo = t
                 break
-        
+
+        # Detectar estado
         estado = None
         for e in ESTADOS_VALIDOS:
             if e.lower() in pregunta:
                 estado = e
                 break
+
+        # Detectar intención de "último/última correlativo"
+        last_correlativo_keywords = ["ultimo", "último", "ultima", "última"]
+        is_last_correlativo = any(k in pregunta for k in last_correlativo_keywords) and ("correlativo" in pregunta or "correlativos" in pregunta)
+
+        # Detectar intención de "huecos/faltantes en correlativos"
+        gap_keywords = ["faltan", "faltante", "huecos", "hueco", "pendientes de registrar", "por registrar", "faltan por"]
+        is_gaps = any(k in pregunta for k in gap_keywords) and ("correlativo" in pregunta or "correlativos" in pregunta or "numer" in pregunta or "numero" in pregunta or "secuencia" in pregunta or tipo in ["MEMO", "OFICIO", "CIRCULAR", "INFORME", "NOTA", "ACTA", "RESOLUCION", "SOLICITUD", "RECIBO", "OTRO"])
         
-        # Detectar intención de conteo
+        # Si no hay tipo específico pero sí palabras de huecos, intentar detectar tipo
+        if is_gaps and not tipo:
+            for t in TIPOS_VALIDOS:
+                if t.lower() in pregunta:
+                    tipo = t
+                    break
+
+        # Detectar subtipo "nota de entrega" / "entrega" para búsqueda en asunto
+        # Si preguntan "notas de entrega", "nota de entrega", "entregas" -> buscar NOTA con search="entrega"
+        search_subtipo = None
+        if tipo == "NOTA" and ("de entrega" in pregunta or "entregas" in pregunta or "entrega" in pregunta):
+            search_subtipo = "entrega"
+        elif "nota de entrega" in pregunta or "notas de entrega" in pregunta:
+            # Si no se detectó tipo NOTA pero preguntan por "nota de entrega"
+            tipo = "NOTA"
+            search_subtipo = "entrega"
+
+        # Detectar intención de conteo (con normalización Unicode)
+        import unicodedata
         count_keywords = ["cuantos", "cuántos", "cuantas", "cuántas", "total", "numero", "número"]
-        is_count = any(k in pregunta for k in count_keywords)
-        
+        # Normalizar a NFC para comparar correctamente acentos
+        pregunta_nfc = unicodedata.normalize("NFC", pregunta)
+        count_keywords_nfc = [unicodedata.normalize("NFC", k) for k in count_keywords]
+        is_count = any(k in pregunta_nfc for k in count_keywords_nfc)
+
         # Detectar filtros temporales
         fecha_desde = None
+        fecha_hasta = None
         mes_actual = False
         if "este mes" in pregunta or "mes actual" in pregunta:
             hoy = date.today()
             inicio_mes = date(hoy.year, hoy.month, 1).isoformat()
+            fin_mes = date(hoy.year, hoy.month, calendar.monthrange(hoy.year, hoy.month)[1]).isoformat()
             fecha_desde = inicio_mes
+            fecha_hasta = fin_mes
             mes_actual = True
+
+        # Obtener lista de oficinas del backend para detectar siglas en la pregunta
+        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+            resp = await client.get("http://osda-backend:8000/api/oficinas")
+            resp.raise_for_status()
+            oficinas = resp.json()
+        oficinas_siglas = [o["sigla"].lower() for o in oficinas if o.get("activa")]
+
+        # Mapeo de nombres comunes/alias a siglas para consultas en lenguaje natural
+        import unicodedata
+        def _normalize(s: str) -> str:
+            """Normalizar: minúsculas + quitar acentos (NFD + remover marcas)"""
+            return "".join(c for c in unicodedata.normalize("NFD", s.lower()) if not unicodedata.combining(c))
         
+        OFICINA_ALIASES = {}
+        for o in oficinas:
+            if not o.get("activa"):
+                continue
+            sigla = o["sigla"].upper()
+            nombre = o.get("nombre", "")
+            # Agregar sigla normalizada
+            OFICINA_ALIASES[_normalize(sigla)] = sigla
+            # Agregar nombre completo normalizado
+            if nombre:
+                OFICINA_ALIASES[_normalize(nombre)] = sigla
+            # Agregar palabras clave del nombre normalizadas
+            palabras_nombre = nombre.split()
+            for palabra in palabras_nombre:
+                if len(palabra) > 3:  # Solo palabras significativas
+                    OFICINA_ALIASES[_normalize(palabra)] = sigla
+
+        # Detectar si la pregunta tiene relación con documentos
+        # Palabras clave relacionadas con documentos
+        DOCUMENT_KEYWORDS = TIPOS_VALIDOS + ESTADOS_VALIDOS + [
+            "cuantos", "cuántos", "cuantas", "cuántas", "total", "numero", "número",
+            "documento", "documentos", "memo", "memos", "oficio", "oficios",
+            "correlativo", "correlativos", "pendiente", "pendientes",
+            "registrado", "registrados", "archivado", "archivados",
+            "recibido", "respondido", "tramite", "trámite",
+            "este mes", "mes actual", "ultimo", "último", "ultima", "última",
+        ]
+        DOCUMENT_KEYWORDS.extend(oficinas_siglas)
+        DOCUMENT_KEYWORDS.extend(OFICINA_ALIASES.keys())
+
+        # Verificar si la pregunta tiene al menos una palabra clave de documentos
+        es_consulta_documentos = any(kw in pregunta for kw in DOCUMENT_KEYWORDS)
+
+        if not es_consulta_documentos:
+            await update.message.reply_text(
+                "🤖 **Solo consultas relacionadas con documentos**\n\n"
+                "Este bot está diseñado para consultar información sobre documentos, "
+                "memos, oficios, correlativos, estados, oficinas, etc.\n\n"
+                "**Ejemplos de lo que puedo hacer:**\n"
+                "• `/consulta cuantos memos para OGH`\n"
+                "• `/consulta cuantos oficios pendientes en OTIC`\n"
+                "• `/consulta cuantos documentos de JUR este mes`\n"
+                "• `/consulta cual es el ultimo correlativo de OTIC MEMO`\n"
+                "• `/consulta cuantos informes archivados`\n\n"
+                "Para otras consultas, por favor contacta al administrador.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Detectar oficina (sigla o alias) en la pregunta
+        oficina = None
+        oficina_destino = None
+        
+        # Normalizar pregunta para matching (quitar acentos)
+        pregunta_norm = _normalize(pregunta)
+        
+        # Primero buscar por alias (nombres completos y palabras clave)
+        # Ordenar por longitud descendente para coincidir frases más largas primero
+        sorted_aliases = sorted(OFICINA_ALIASES.items(), key=lambda x: -len(x[0]))
+        for alias, sigla in sorted_aliases:
+            # alias ya está normalizado
+            if f" {alias} " in f" {pregunta_norm} " or pregunta_norm.startswith(f"{alias} ") or pregunta_norm.endswith(f" {alias}"):
+                # Check for destination patterns
+                if f"para {alias}" in pregunta_norm or f"a {alias}" in pregunta_norm:
+                    if not oficina_destino:  # Only set if not already found
+                        oficina_destino = sigla
+                # Check for origin patterns
+                elif f"de {alias}" in pregunta_norm or f"desde {alias}" in pregunta_norm:
+                    if not oficina:  # Only set if not already found
+                        oficina = sigla
+                # Default to origin if no specific pattern and no origin yet
+                elif not oficina:
+                    oficina = sigla
+        
+        # Si no se encontró por alias, buscar por sigla directa
+        if not oficina and not oficina_destino:
+            for sigla in oficinas_siglas:
+                if f" {sigla} " in f" {pregunta} " or pregunta.startswith(f"{sigla} ") or pregunta.endswith(f" {sigla}"):
+                    if f"para {sigla}" in pregunta or f"a {sigla}" in pregunta:
+                        oficina_destino = sigla.upper()
+                    elif f"de {sigla}" in pregunta or f"desde {sigla}" in pregunta:
+                        oficina = sigla.upper()
+                    elif not oficina:
+                        oficina = sigla.upper()
+                    break
+
         # Ejecutar consulta según intención
         filtros = {}
         if tipo:
             filtros["tipo_documento"] = tipo
         if estado:
             filtros["estado"] = estado
+        if oficina:
+            filtros["oficina_origen"] = oficina
+        if oficina_destino:
+            filtros["oficina_destino"] = oficina_destino
         if fecha_desde:
             filtros["fecha_desde"] = fecha_desde
-        
-        docs = await consultar_documentos(**filtros, limit=1000)
-        
-        if is_count:
+        if fecha_hasta:
+            filtros["fecha_hasta"] = fecha_hasta
+        if search_subtipo:
+            filtros["search"] = search_subtipo
+
+        # Para último correlativo: ordenar por fecha descendente y límite 1
+        if is_last_correlativo:
+            filtros["order"] = "fecha_documento.desc"
+            docs = await consultar_documentos(**filtros, limit=1)
+
             # Filtrar adicionales en Python para consultas complejas
             if mes_actual:
                 hoy = date.today()
                 docs = [d for d in docs if d.get("fecha_documento", "").startswith(f"{date.today().year}-{date.today().month:02d}")]
-            
+
             respuesta = f"📊 **Consulta: {' '.join(args)}**\n\n"
             respuesta += f"📊 **Total: {len(docs)}**"
             if tipo:
@@ -554,7 +698,7 @@ async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if mes_actual:
                 respuesta += " este mes"
             respuesta += "\n"
-            
+
             # Agregar desglose si hay pocos resultados
             if len(docs) <= 20:
                 respuesta += "\n*Detalle:*\n"
@@ -562,13 +706,87 @@ async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     respuesta += f"• `{d.get('correlativo', 'N/A')}` - {d.get('asunto', 'Sin asunto')[:50]}\n"
                 if len(docs) > 10:
                     respuesta += f"... y {len(docs) - 10} más"
-        else:
-            # Consulta de listado
-            await _listar_documentos(update, context, {"tipo_documento": tipo, "estado": estado, "fecha_desde": fecha_desde} if fecha_desde else {"tipo_documento": tipo, "estado": estado} if estado else {"tipo_documento": tipo} if tipo else {}, f"Consulta: {' '.join(args)}")
+
+            await update.message.reply_text(respuesta, parse_mode="Markdown")
             return
-        
-        await update.message.reply_text(respuesta, parse_mode="Markdown")
-        
+
+        # Para consultas de huecos/faltantes en correlativos
+        if is_gaps:
+            if not oficina:
+                respuesta = "❌ Necesitas especificar una oficina (ej: OTIC, OGH, Presidencia, etc.)"
+                await update.message.reply_text(respuesta, parse_mode="Markdown")
+                return
+            if not tipo:
+                respuesta = "❌ Necesitas especificar un tipo de documento (MEMO, OFICIO, INFORME, NOTA, etc.)"
+                await update.message.reply_text(respuesta, parse_mode="Markdown")
+                return
+            
+            from bot.core.backend_client import detectar_huecos_correlativo
+            resultado = await detectar_huecos_correlativo(oficina, tipo)
+            
+            if resultado["total_registrados"] == 0:
+                respuesta = f"📭 No hay {tipo}s registrados para {oficina}"
+            else:
+                huecos = resultado["huecos"]
+                respuesta = f"🔍 **Huecos en correlativos {tipo} - {oficina}**\n\n"
+                respuesta += f"📋 Registrados: {resultado['total_registrados']}\n"
+                respuesta += f"🔢 Máximo secuencia: {resultado['max_secuencia']}\n"
+                respuesta += f"❌ Faltantes: {len(huecos)}\n\n"
+                
+                if huecos:
+                    respuesta += f"📋 **Correlativos faltantes:**\n"
+                    # Mostrar los huecos como correlativos completos
+                    # Necesitamos saber el formato: OTIC-MEMO-2026-XXX
+                    # Usamos el año actual y el formato detectado
+                    hoy = date.today()
+                    anio = str(hoy.year)
+                    # Detectar prefijo del primer correlativo registrado
+                    primer_corr = resultado["correlativos_registrados"][0] if resultado["correlativos_registrados"] else ""
+                    prefijo = ""
+                    if primer_corr:
+                        # Extraer todo antes del último número
+                        import re
+                        match = re.match(r'^(.+-\d{4}-)', primer_corr)
+                        if match:
+                            prefijo = match.group(1)
+                    
+                    for h in huecos[:20]:
+                        if prefijo:
+                            respuesta += f"• `{prefijo}{h:03d}`\n"
+                        else:
+                            respuesta += f"• Secuencia `{h}`\n"
+                    if len(huecos) > 20:
+                        respuesta += f"... y {len(huecos) - 20} más\n"
+                else:
+                    respuesta += "✅ No hay huecos en la numeración."
+            
+            await update.message.reply_text(respuesta, parse_mode="Markdown")
+            return
+
+        # Para consultas de conteo: usar return_count=True para obtener total del backend
+        if is_count:
+            docs, total = await consultar_documentos(**filtros, limit=1000, return_count=True)
+
+            respuesta = f"📊 **Consulta: {' '.join(args)}**\n\n"
+            respuesta += f"📊 **Total: {total}**"
+            if tipo:
+                respuesta += f" {tipo}"
+            if estado:
+                respuesta += f" {estado}"
+            if oficina:
+                respuesta += f" de {oficina}"
+            if oficina_destino:
+                respuesta += f" para {oficina_destino}"
+            if mes_actual:
+                respuesta += " este mes"
+            respuesta += "\n"
+
+            await update.message.reply_text(respuesta, parse_mode="Markdown")
+            return
+
+        # Consulta de listado normal
+        await _listar_documentos(update, context, filtros, f"Consulta: {' '.join(args)}")
+
     except Exception as e:
         logger.error(f"Error en consulta_command: {e}")
         await update.message.reply_text("❌ Error procesando consulta")

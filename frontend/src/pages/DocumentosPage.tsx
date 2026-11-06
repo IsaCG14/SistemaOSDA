@@ -121,14 +121,11 @@ export function DocumentosPage() {
       if (fechaHasta) params.append('fecha_hasta', fechaHasta)
       
       const resp = await api.get(`/documentos?${params}`)
-      // Guardar el total count en un ref global o usar response headers
-      // Para useQuery, necesitamos devolver un objeto con data y totalCount
       return {
         data: resp.data,
         totalCount: parseInt(resp.headers?.['x-total-count'] || '0', 10)
       }
     },
-    select: (result) => result.data,
     placeholderData: (previousData) => previousData,
   })
 
@@ -308,10 +305,8 @@ export function DocumentosPage() {
     )
   }
 
-  const documentos = data || []
-  // Obtener totalCount del cache de la query
-  const queryData = queryClient.getQueryData(['documentos', page, pageSize, debouncedSearch, estadoFiltro, tipoFiltro, oficinaOrigenFiltro, oficinaDestinoFiltro, fechaDesde, fechaHasta])
-  const totalCount = (queryData as { data: any[], totalCount: number } | undefined)?.totalCount || 0
+  const documentos = data?.data || []
+  const totalCount = data?.totalCount || 0
   const totalPages = totalCount > 0 ? Math.ceil(totalCount / pageSize) : 1
 
   return (

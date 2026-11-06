@@ -46,7 +46,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (personaResp.data?.[0]) oficina_sigla = personaResp.data[0].oficina_sigla
       }
       
-      setUser({ ...userData, oficina_sigla })
+      // Extraer nombre de user_metadata (GoTrue lo pone ahí)
+      const nombre = userData.user_metadata?.nombre || userData.nombre || ''
+      
+      setUser({ ...userData, nombre, oficina_sigla })
     } catch {
       localStorage.removeItem('access_token')
       delete api.defaults.headers.common['Authorization']
@@ -69,7 +72,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         if (personaResp.data?.[0]) oficina_sigla = personaResp.data[0].oficina_sigla
       }
       
-      setUser({ ...userData, oficina_sigla })
+      // Extraer nombre de user_metadata (GoTrue lo pone ahí)
+      const nombre = userData.user_metadata?.nombre || userData.nombre || ''
+      
+      setUser({ ...userData, nombre, oficina_sigla })
     }
 
   const logout = () => {

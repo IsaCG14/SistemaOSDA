@@ -36,9 +36,16 @@ async def consultar_documentos(
     fecha_hasta: Optional[str] = None,
     limit: int = 10,
     offset: int = 0,
-) -> List[Dict[str, Any]]:
-    """Consultar documentos al backend. Devuelve lista de dicts (puede ser vacia)."""
+    order: Optional[str] = None,
+    return_count: bool = False,
+) -> List[Dict[str, Any]] | Tuple[List[Dict[str, Any]], int]:
+    """Consultar documentos al backend. Devuelve lista de dicts (puede ser vacia).
+    
+    Si return_count=True, devuelve una tupla (documentos, total_count).
+    """
     params: Dict[str, Any] = {"limit": limit, "offset": offset}
+    if order:
+        params["order"] = order
     if search:
         params["search"] = search
     if tipo_documento:
@@ -57,7 +64,11 @@ async def consultar_documentos(
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
             resp = await client.get(BASE_URL, params=params)
             resp.raise_for_status()
-            return resp.json()
+            docs = resp.json()
+            if return_count:
+                total = int(resp.headers.get("X-Total-Count", "0"))
+                return docs, total
+            return docs
     except Exception as e:
         logger.error(f"consultar_documentos_failed: {e}")
         raise
@@ -164,6 +175,10 @@ async def detectar_huecos_correlativo(
         oficina_origen=oficina_sigla,
         limit=1000
     )
+    
+    # Handle both old and new return types
+    if isinstance(docs, tuple):
+        docs = docs[0]
     
     secuencias = []
     correlativos_encontrados = []
