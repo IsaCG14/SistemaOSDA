@@ -24,6 +24,11 @@ http://corpocentro.osda.net, http://localhost, http://127.0.0.1, http://192.168.
         reverse_proxy supabase-kong:8000
     }
 
+    # Configuración general - DEBE ir ANTES que /api* general
+    handle /api/configuracion* {
+        reverse_proxy backend:8000
+    }
+
     # Frontend (React) - Producción (nginx sirviendo archivos estáticos)
     # Debe ir ANTES que el catch-all del backend
     handle /assets* {

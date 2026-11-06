@@ -1,16 +1,35 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api'
 import { 
   Settings, User, Shield, Database, Bell, 
-  Loader2, Save, CheckCircle, AlertCircle, Plus
+  Loader2, Save, CheckCircle, AlertCircle, Plus,
+  Edit, Lock
 } from 'lucide-react'
 import { LoadingSpinner } from '../components/LoadingSpinner'
 import { useAuth } from '../hooks/useAuth'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { format } from 'date-fns'
 import { es } from 'date-fns/locale'
 
 export function ConfiguracionPage() {
+  const { user, logout } = useAuth()
+  const location = useLocation()
+  const navigate = useNavigate()
+
+  // Solo ADMIN puede acceder a configuración
+  const esAdmin = (user as any)?.user_metadata?.role === 'ADMIN' || (user as any)?.app_metadata?.role === 'ADMIN'
+  
+  useEffect(() => {
+    if (!esAdmin) {
+      navigate('/dashboard', { replace: true })
+    }
+  }, [esAdmin, navigate])
+
+  if (!esAdmin) {
+    return null // O un LoadingSpinner mientras redirige
+  }
+
   const [activeTab, setActiveTab] = useState<'general' | 'usuarios' | 'sistema' | 'backup'>('general')
   const [saving, setSaving] = useState(false)
 
@@ -28,7 +47,7 @@ export function ConfiguracionPage() {
         <p className="text-muted mt-1">Ajustes del sistema y parámetros</p>
       </div>
 
-      <div className="card">
+      <div className="card w-full">
         <div className="border-b border-default">
           <nav className="flex overflow-x-auto" aria-label="Tabs">
             {tabs.map((tab) => (
@@ -70,6 +89,25 @@ function GeneralSettings() {
     retencion_dias: 0,
     bucket_storage: 'documents',
   })
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState(false)
+
+  useEffect(() => {
+    cargarConfiguracion()
+  }, [])
+
+  const cargarConfiguracion = async () => {
+    try {
+      setLoading(true)
+      const resp = await api.get('/configuracion')
+      setSettings(resp.data)
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || 'Error cargando configuración')
+    } finally {
+      setLoading(false)
+    }
+  }
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value, type } = e.target
@@ -79,8 +117,34 @@ function GeneralSettings() {
     }))
   }
 
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    setSuccess(false)
+    try {
+      setLoading(true)
+      await api.put('/configuracion', settings)
+      setSuccess(true)
+      setTimeout(() => setSuccess(false), 3000)
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || 'Error guardando configuración')
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
-    <form onSubmit={(e) => { e.preventDefault(); alert('Configuración guardada') }} className="space-y-6 max-w-2xl">
+    <form onSubmit={handleSubmit} className="space-y-6 w-full">
+      {error && (
+        <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 text-sm">
+          {error}
+        </div>
+      )}
+      {success && (
+        <div className="p-3 rounded-lg bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 text-sm">
+          Configuración guardada correctamente
+        </div>
+      )}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div>
           <label className="label">Nombre del sitio</label>
@@ -171,9 +235,10 @@ function GeneralSettings() {
       </div>
 
       <div className="flex justify-end pt-4 border-t border-default">
-        <button type="submit" className="btn-primary flex items-center gap-2">
+        <button type="submit" disabled={loading} className="btn-primary flex items-center gap-2">
+          {loading && <Loader2 className="w-4 h-4 animate-spin" />}
+          {loading ? 'Guardando...' : 'Guardar Cambios'}
           <Save className="w-4 h-4" />
-          Guardar Cambios
         </button>
       </div>
     </form>
@@ -184,8 +249,14 @@ function UsuariosSettings() {
   const queryClient = useQueryClient()
   const { user } = useAuth()
   const [showModal, setShowModal] = useState(false)
+  const [editModal, setEditModal] = useState<{ email: string; role: string; nombre: string } | null>(null)
+  const [passwordModal, setPasswordModal] = useState<string | null>(null)
   const [form, setForm] = useState({ email: '', password: '', confirmar: '', role: 'SECRETARIO', nombre: '' })
+  const [editForm, setEditForm] = useState({ role: 'SECRETARIO', nombre: '' })
+  const [passwordForm, setPasswordForm] = useState({ password: '', confirmar: '' })
   const [errorMsg, setErrorMsg] = useState('')
+  const [editErrorMsg, setEditErrorMsg] = useState('')
+  const [passwordErrorMsg, setPasswordErrorMsg] = useState('')
 
   const esAdmin =
     (user as any)?.user_metadata?.role === 'ADMIN' || (user as any)?.app_metadata?.role === 'ADMIN'
@@ -197,6 +268,7 @@ function UsuariosSettings() {
       return resp.data as Array<{
         email: string
         role: string
+        nombre: string
         activo: boolean
         email_confirmado: boolean
         ultimo_acceso: string
@@ -221,6 +293,36 @@ function UsuariosSettings() {
     },
   })
 
+  const editarMutation = useMutation({
+    mutationFn: async (datos: { email: string; role: string; nombre: string }) => {
+      const resp = await api.put(`/usuarios/${encodeURIComponent(datos.email)}`, datos)
+      return resp.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['usuarios'] })
+      setEditModal(null)
+      setEditErrorMsg('')
+    },
+    onError: (err: any) => {
+      setEditErrorMsg(err?.response?.data?.detail || err?.message || 'Error desconocido')
+    },
+  })
+
+  const passwordMutation = useMutation({
+    mutationFn: async (datos: { email: string; password: string }) => {
+      const resp = await api.put(`/usuarios/${encodeURIComponent(datos.email)}`, datos)
+      return resp.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['usuarios'] })
+      setPasswordModal(null)
+      setPasswordErrorMsg('')
+    },
+    onError: (err: any) => {
+      setPasswordErrorMsg(err?.response?.data?.detail || err?.message || 'Error desconocido')
+    },
+  })
+
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     setErrorMsg('')
@@ -240,6 +342,49 @@ function UsuariosSettings() {
     })
   }
 
+  const handleEdit = (u: { email: string; role: string; nombre?: string }) => {
+    setEditForm({ role: u.role, nombre: u.nombre || '' })
+    setEditModal({ email: u.email, role: u.role, nombre: u.nombre || '' })
+    setEditErrorMsg('')
+  }
+
+  const handleChangePassword = (email: string) => {
+    setPasswordForm({ password: '', confirmar: '' })
+    setPasswordModal(email)
+    setPasswordErrorMsg('')
+  }
+
+  const submitEdit = (e: React.FormEvent) => {
+    e.preventDefault()
+    setEditErrorMsg('')
+    if (editModal) {
+      editarMutation.mutate({
+        email: editModal.email,
+        role: editForm.role,
+        nombre: editForm.nombre || undefined,
+      })
+    }
+  }
+
+  const submitPassword = (e: React.FormEvent) => {
+    e.preventDefault()
+    setPasswordErrorMsg('')
+    if (passwordForm.password !== passwordForm.confirmar) {
+      setPasswordErrorMsg('Las contraseñas no coinciden')
+      return
+    }
+    if (passwordForm.password.length < 8) {
+      setPasswordErrorMsg('La contraseña debe tener al menos 8 caracteres')
+      return
+    }
+    if (passwordModal) {
+      passwordMutation.mutate({
+        email: passwordModal,
+        password: passwordForm.password,
+      })
+    }
+  }
+
   const inicial = (email: string) => (email || '?').charAt(0).toUpperCase()
 
   const formatearFecha = (iso: string) => {
@@ -257,7 +402,7 @@ function UsuariosSettings() {
   }
 
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className="w-full space-y-6">
       <div className="flex items-center justify-between">
         <h3 className="text-lg font-semibold text-heading">Gestión de Usuarios</h3>
         {esAdmin && (
@@ -272,7 +417,7 @@ function UsuariosSettings() {
       </div>
 
       <div className="card">
-        <div className="overflow-x-auto">
+        <div className="overflow-hidden">
           {isLoading ? (
             <div className="p-8 text-center text-muted">Cargando usuarios…</div>
           ) : error ? (
@@ -280,51 +425,76 @@ function UsuariosSettings() {
               Error cargando usuarios: {(error as Error).message}
             </div>
           ) : (
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-default">
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Usuario</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Rol</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Estado</th>
-                  <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Último Acceso</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-default">
-                {usuarios?.map((u) => (
-                  <tr key={u.email} className="card-hover">
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-3">
-                        <div className="w-8 h-8 bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center">
-                          <span className="text-blue-700 dark:text-blue-400 font-medium">{inicial(u.email)}</span>
-                        </div>
-                        <div>
-                          <p className="font-medium text-heading">{u.email}</p>
-                          {!u.email_confirmado && (
-                            <p className="text-xs text-yellow-600 dark:text-yellow-400">Email sin confirmar</p>
-                          )}
-                        </div>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className={`badge ${u.role === 'ADMIN' ? 'badge-danger' : 'badge-info'}`}>{u.role}</span>
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className={`badge ${u.activo ? 'badge-success' : 'badge-gray'}`}>
-                        {u.activo ? 'Activo' : 'Suspendido'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-sm text-muted">{formatearFecha(u.ultimo_acceso)}</td>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[700px]">
+                <thead>
+                  <tr className="border-b border-default">
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase w-[300px]">Usuario</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase w-[150px]">Nombre</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase w-[120px]">Rol</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase w-[120px]">Estado</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Último Acceso</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase w-[100px]">Acciones</th>
                   </tr>
-                ))}
-                {!usuarios?.length && (
-                  <tr>
-                    <td colSpan={4} className="px-4 py-8 text-center text-muted">
-                      No hay usuarios registrados
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-default">
+                  {usuarios?.map((u) => (
+                    <tr key={u.email} className="card-hover">
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className="w-8 h-8 bg-blue-100 dark:bg-blue-900/30 rounded-full flex items-center justify-center flex-shrink-0">
+                            <span className="text-blue-700 dark:text-blue-400 font-medium">{inicial(u.email)}</span>
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <p className="font-medium text-heading truncate">{u.email}</p>
+                            {!u.email_confirmado && (
+                              <p className="text-xs text-yellow-600 dark:text-yellow-400 truncate">Email sin confirmar</p>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 whitespace-nowrap">
+                        <span className={`badge ${u.role === 'ADMIN' ? 'badge-danger' : 'badge-info'}`}>{u.role}</span>
+                      </td>
+                      <td className="px-4 py-3 whitespace-nowrap">
+                        <span className={`badge ${u.activo ? 'badge-success' : 'badge-gray'}`}>
+                          {u.activo ? 'Activo' : 'Suspendido'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 whitespace-nowrap text-sm text-muted">
+                        {u.nombre || '—'}
+                      </td>
+                      <td className="px-4 py-3 whitespace-nowrap">{formatearFecha(u.ultimo_acceso)}</td>
+                      <td className="px-4 py-3 whitespace-nowrap">
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            onClick={() => handleEdit(u)}
+                            className="btn-ghost p-2 text-sm"
+                            title="Editar usuario"
+                          >
+                            <Edit className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => handleChangePassword(u.email)}
+                            className="btn-ghost p-2 text-sm"
+                            title="Cambiar contraseña"
+                          >
+                            <Lock className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                  {!usuarios?.length && (
+                    <tr>
+                      <td colSpan={5} className="px-4 py-8 text-center text-muted">
+                        No hay usuarios registrados
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       </div>
@@ -441,13 +611,163 @@ function UsuariosSettings() {
           </div>
         </div>
       )}
+
+      {/* Modal: Editar usuario */}
+      {editModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setEditModal(null)}>
+          <div
+            className="card w-full max-w-md p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-heading">Editar Usuario</h3>
+              <button onClick={() => setEditModal(null)} className="text-muted hover:text-heading text-xl leading-none" aria-label="Cerrar">
+                ×
+              </button>
+            </div>
+
+            <form onSubmit={submitEdit} className="space-y-4">
+              <p className="text-sm text-muted">{editModal.email}</p>
+
+              <div>
+                <label className="label">Nombre (opcional)</label>
+                <input
+                  type="text"
+                  value={editForm.nombre}
+                  onChange={(e) => setEditForm({ ...editForm, nombre: e.target.value })}
+                  className="input w-full"
+                  placeholder="Nombre y apellido"
+                  autoComplete="off"
+                />
+              </div>
+
+              <div>
+                <label className="label">Rol</label>
+                <select
+                  value={editForm.role}
+                  onChange={(e) => setEditForm({ ...editForm, role: e.target.value })}
+                  className="input w-full"
+                >
+                  <option value="SECRETARIO">SECRETARIO</option>
+                  <option value="ADMIN">ADMIN</option>
+                </select>
+              </div>
+
+              {editErrorMsg && (
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 text-sm">
+                  {editErrorMsg}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setEditModal(null)}
+                  className="btn-secondary"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={editarMutation.isPending}
+                  className="btn-primary flex items-center gap-2"
+                >
+                  {editarMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
+                  {editarMutation.isPending ? 'Actualizando...' : 'Guardar Cambios'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Cambiar contraseña */}
+      {passwordModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onClick={() => setPasswordModal(null)}>
+          <div
+            className="card w-full max-w-md p-6 space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-heading">Cambiar Contraseña</h3>
+              <button onClick={() => setPasswordModal(null)} className="text-muted hover:text-heading text-xl leading-none" aria-label="Cerrar">
+                ×
+              </button>
+            </div>
+
+            <form onSubmit={submitPassword} className="space-y-4">
+              <p className="text-sm text-muted">{passwordModal}</p>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="label">Nueva Contraseña</label>
+                  <input
+                    type="password"
+                    required
+                    minLength={8}
+                    value={passwordForm.password}
+                    onChange={(e) => setPasswordForm({ ...passwordForm, password: e.target.value })}
+                    className="input w-full"
+                    placeholder="Mínimo 8 caracteres"
+                    autoComplete="new-password"
+                  />
+                </div>
+                <div>
+                  <label className="label">Confirmar</label>
+                  <input
+                    type="password"
+                    required
+                    value={passwordForm.confirmar}
+                    onChange={(e) => setPasswordForm({ ...passwordForm, confirmar: e.target.value })}
+                    className="input w-full"
+                    placeholder="Repetir contraseña"
+                    autoComplete="new-password"
+                  />
+                </div>
+              </div>
+
+              {passwordErrorMsg && (
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 text-sm">
+                  {passwordErrorMsg}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setPasswordModal(null)}
+                  className="btn-secondary"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={passwordMutation.isPending}
+                  className="btn-primary flex items-center gap-2"
+                >
+                  {passwordMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
+                  {passwordMutation.isPending ? 'Actualizando...' : 'Cambiar Contraseña'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      <div className="card p-6 border-border bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800">
+        <h4 className="font-medium text-blue-900 dark:text-blue-300 mb-2">Autenticación</h4>
+        <p className="text-sm text-blue-700 dark:text-blue-400">
+          Los usuarios se autentican vía Supabase Auth (email y contraseña).
+          {!esAdmin && ' Solo un ADMIN puede registrar nuevos usuarios.'}
+        </p>
+      </div>
     </div>
   )
 }
 
 function SistemaSettings() {
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className="w-full space-y-6">
       <div>
         <h3 className="text-lg font-semibold text-heading">Estado de Servicios</h3>
       </div>
@@ -603,7 +923,7 @@ function BackupSettings() {
   const ultimoSql = sqlBackups[0]
 
   return (
-    <div className="max-w-2xl space-y-6">
+    <div className="w-full space-y-6">
       <div className="flex items-center justify-between">
         <h3 className="text-lg font-semibold text-heading">Gestión de Backups</h3>
         <button

@@ -294,3 +294,20 @@ class DocumentoRawOCR(Base):
     
     # Relaciones
     documento = relationship("Documento", back_populates="raw_ocr")
+
+
+class Configuracion(Base):
+    """Configuración general del sistema (singleton)."""
+    __tablename__ = "configuracion"
+    
+    id = Column(Integer, primary_key=True, default=1)  # Singleton: siempre id=1
+    sitio_nombre = Column(String(200), default="Secretaría", nullable=False)
+    sitio_url = Column(String(500), default="https://docs.corposcentro.local", nullable=False)
+    zona_horaria = Column(String(50), default="America/Caracas", nullable=False)
+    idioma = Column(String(10), default="es", nullable=False)
+    tamano_maximo_subida = Column(Integer, default=10, nullable=False)
+    tipos_permitidos = Column(String(500), default="image/jpeg,image/png,application/pdf", nullable=False)
+    retencion_dias = Column(Integer, default=0, nullable=False)
+    bucket_storage = Column(String(100), default="documents", nullable=False)
+    creado_en = Column(DateTime, default=datetime.utcnow, nullable=False)
+    actualizado_en = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

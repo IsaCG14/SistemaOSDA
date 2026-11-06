@@ -13,7 +13,7 @@ const navigation = [
   { name: 'Tipos de Documento', href: '/tipos-documento', icon: FileStack },
   { name: 'Personas', href: '/personas', icon: Users },
   { name: 'Consultas', href: '/consultas', icon: Search },
-  { name: 'Configuración', href: '/configuracion', icon: Settings },
+  { name: 'Configuración', href: '/configuracion', icon: Settings, adminOnly: true },
 ]
 
 export function Layout() {
@@ -56,7 +56,9 @@ export function Layout() {
           
           {/* Navegación */}
           <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
-            {navigation.map((item) => {
+            {navigation
+              .filter(item => !item.adminOnly || (user as any)?.user_metadata?.role === 'ADMIN' || (user as any)?.app_metadata?.role === 'ADMIN')
+              .map((item) => {
               const isActive = location.pathname === item.href || 
                 (item.href !== '/dashboard' && location.pathname.startsWith(item.href))
               return (

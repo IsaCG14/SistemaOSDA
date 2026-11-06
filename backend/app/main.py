@@ -8,6 +8,7 @@ from datetime import datetime
 import os
 import logging
 import httpx
+import psycopg
 
 from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -1071,6 +1072,12 @@ class UsuarioCreate(BaseModel):
     nombre: Optional[str] = None
 
 
+class UsuarioUpdate(BaseModel):
+    password: Optional[str] = None
+    role: Optional[str] = None
+    nombre: Optional[str] = None
+
+
 def _caller_role(request: Request) -> Optional[str]:
     """Rol del usuario autenticado que hace la peticion (None si token invalido)."""
     from jose import jwt as jose_jwt, JWTError
@@ -1107,12 +1114,17 @@ def _caller_role(request: Request) -> Optional[str]:
 
 @app.get("/api/usuarios")
 async def list_usuarios(request: Request):
-    """Listar cuentas de login (auth.users) - SOLO LECTURA.
+    """Listar cuentas de login (auth.users) - SOLO LECTURA (solo ADMIN).
 
-    Lee email, rol, estado y ultimo acceso desde el schema auth
+    Lee email, rol, nombre, estado y ultimo acceso desde el schema auth
     (no expuesto por PostgREST) via conexion directa a Postgres.
     No modifica nada.
     """
+    # Solo ADMIN puede listar usuarios
+    rol = _caller_role(request)
+    if rol != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede listar usuarios")
+
     import psycopg
     if not SUPABASE_DB_PASSWORD:
         raise HTTPException(status_code=500, detail="SUPABASE_DB_PASSWORD no configurada en el backend")
@@ -1129,6 +1141,7 @@ async def list_usuarios(request: Request):
             cur.execute("""
                 SELECT u.email,
                        coalesce(u.raw_user_meta_data->>'role', 'SECRETARIO') as role,
+                       coalesce(u.raw_user_meta_data->>'nombre', '') as nombre,
                        (u.banned_until IS NULL) as activo,
                        coalesce(u.email_confirmed_at::text, '') as confirmado,
                        coalesce(u.last_sign_in_at::text, u.created_at::text) as ultimo_acceso,
@@ -1142,14 +1155,19 @@ async def list_usuarios(request: Request):
             {
                 "email": f[0],
                 "role": f[1],
-                "activo": f[2],
-                "email_confirmado": bool(f[3]),
-                "ultimo_acceso": f[4],
-                "creado": f[5],
+                "nombre": f[2],
+                "activo": f[3],
+                "email_confirmado": bool(f[4]),
+                "ultimo_acceso": f[5],
+                "creado": f[6],
             }
             for f in filas
         ]
     except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("list_usuarios_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
         raise
     except Exception as e:
         logger.error("list_usuarios_failed", error=str(e))
@@ -1235,6 +1253,98 @@ async def create_usuario(nuevo: UsuarioCreate, request: Request):
         raise
     except Exception as e:
         logger.error("create_usuario_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/usuarios/{email}")
+async def update_usuario(email: str, datos: UsuarioUpdate, request: Request):
+    """Actualizar usuario (solo ADMIN). Permite cambiar contraseña, rol o nombre."""
+    import psycopg
+    import httpx
+
+    # 1. Solo ADMIN puede actualizar usuarios
+    rol = _caller_role(request)
+    if rol != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede actualizar usuarios")
+
+    email = email.strip().lower()
+
+    # 2. Verificar que existe
+    try:
+        conn = psycopg.connect(
+            host="supabase-db",
+            dbname="postgres",
+            user="postgres",
+            password=SUPABASE_DB_PASSWORD,
+            port=5432,
+            connect_timeout=5,
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM auth.users WHERE email = %s", (email,))
+            user_row = cur.fetchone()
+            if not user_row:
+                conn.close()
+                raise HTTPException(status_code=404, detail="Usuario no encontrado")
+            user_id = user_row[0]
+        conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("update_usuario_check_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # 3. Actualizar via GoTrue Admin API
+    try:
+        admin_client = httpx.AsyncClient(timeout=15, trust_env=False)
+        update_data = {}
+        if datos.password:
+            if len(datos.password) < 8:
+                raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
+            update_data["password"] = datos.password
+        if datos.role:
+            if datos.role not in ("ADMIN", "SECRETARIO"):
+                raise HTTPException(status_code=400, detail="Rol inválido (ADMIN o SECRETARIO)")
+            update_data["user_metadata"] = {"role": datos.role}
+        if datos.nombre is not None:
+            if "user_metadata" not in update_data:
+                update_data["user_metadata"] = {}
+            update_data["user_metadata"]["nombre"] = datos.nombre
+
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No hay datos para actualizar")
+
+        resp = await admin_client.put(
+            f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=update_data,
+        )
+        await admin_client.aclose()
+
+        if resp.status_code not in (200, 201):
+            detail = "Error actualizando usuario en GoTrue"
+            try:
+                detail = resp.json().get("msg") or resp.json().get("message") or detail
+            except Exception:
+                pass
+            logger.error("update_usuario_gotrue_failed", status=resp.status_code, body=resp.text[:300])
+            raise HTTPException(status_code=resp.status_code, detail=detail)
+
+        actualizado = resp.json()
+        logger.info("usuario_actualizado", email=email)
+        return {
+            "email": actualizado.get("email", email),
+            "role": datos.role or actualizado.get("user_metadata", {}).get("role"),
+            "nombre": datos.nombre or actualizado.get("user_metadata", {}).get("nombre"),
+            "message": "Usuario actualizado correctamente",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("update_usuario_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1654,6 +1764,124 @@ async def delete_tipo_documento(codigo: str, client: httpx.AsyncClient = Depends
         raise HTTPException(status_code=500, detail=f"Error eliminando tipo documento: {e.response.text}")
     except Exception as e:
         logger.error("delete_tipo_documento_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINTS - CONFIGURACIÓN GENERAL
+# ─────────────────────────────────────────────────────────────────
+
+class ConfiguracionGeneral(BaseModel):
+    sitio_nombre: str
+    sitio_url: str
+    zona_horaria: str
+    idioma: str
+    tamano_maximo_subida: int
+    tipos_permitidos: str
+    retencion_dias: int
+    bucket_storage: str
+
+
+@app.get("/api/configuracion")
+async def get_configuracion(request: Request):
+    """Obtener configuración general del sistema (solo ADMIN)."""
+    rol = _caller_role(request)
+    if rol != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede ver la configuración")
+
+    try:
+        conn = psycopg.connect(
+            host="supabase-db",
+            dbname="postgres",
+            user="postgres",
+            password=SUPABASE_DB_PASSWORD,
+            port=5432,
+            connect_timeout=5,
+        )
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM configuracion WHERE id = 1")
+            fila = cur.fetchone()
+        conn.close()
+
+        if not fila:
+            # Retornar valores por defecto si no existe
+            return {
+                "id": 1,
+                "sitio_nombre": "Secretaría",
+                "sitio_url": "https://docs.corposcentro.local",
+                "zona_horaria": "America/Caracas",
+                "idioma": "es",
+                "tamano_maximo_subida": 10,
+                "tipos_permitidos": "image/jpeg,image/png,application/pdf",
+                "retencion_dias": 0,
+                "bucket_storage": "documents",
+            }
+
+        return {
+            "id": fila[0],
+            "sitio_nombre": fila[1],
+            "sitio_url": fila[2],
+            "zona_horaria": fila[3],
+            "idioma": fila[4],
+            "tamano_maximo_subida": fila[5],
+            "tipos_permitidos": fila[6],
+            "retencion_dias": fila[7],
+            "bucket_storage": fila[8],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("get_configuracion_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/configuracion")
+async def update_configuracion(datos: ConfiguracionGeneral, request: Request):
+    """Actualizar configuración general (solo ADMIN)."""
+    rol = _caller_role(request)
+    if rol != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede actualizar la configuración")
+
+    try:
+        conn = psycopg.connect(
+            host="supabase-db",
+            dbname="postgres",
+            user="postgres",
+            password=SUPABASE_DB_PASSWORD,
+            port=5432,
+            connect_timeout=5,
+        )
+        with conn.cursor() as cur:
+            # Upsert: insertar si no existe, actualizar si existe
+            cur.execute("""
+                INSERT INTO configuracion (id, sitio_nombre, sitio_url, zona_horaria, idioma, 
+                    tamano_maximo_subida, tipos_permitidos, retencion_dias, bucket_storage)
+                VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    sitio_nombre = EXCLUDED.sitio_nombre,
+                    sitio_url = EXCLUDED.sitio_url,
+                    zona_horaria = EXCLUDED.zona_horaria,
+                    idioma = EXCLUDED.idioma,
+                    tamano_maximo_subida = EXCLUDED.tamano_maximo_subida,
+                    tipos_permitidos = EXCLUDED.tipos_permitidos,
+                    retencion_dias = EXCLUDED.retencion_dias,
+                    bucket_storage = EXCLUDED.bucket_storage,
+                    actualizado_en = NOW()
+                RETURNING id
+            """, (
+                datos.sitio_nombre, datos.sitio_url, datos.zona_horaria, datos.idioma,
+                datos.tamano_maximo_subida, datos.tipos_permitidos, 
+                datos.retencion_dias, datos.bucket_storage
+            ))
+            conn.commit()
+            fila = cur.fetchone()
+        conn.close()
+
+        return {"message": "Configuración actualizada correctamente", "id": fila[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("update_configuracion_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
