@@ -1,7 +1,7 @@
 import axios from 'axios'
 
 const API_URL = import.meta.env?.VITE_API_URL || '/api'
-const SUPABASE_ANON_KEY = import.meta.env?.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0'
+const SUPABASE_ANON_KEY = import.meta.env?.VITE_SUPABASE_ANON_KEY || ''
 
 export const api = axios.create({
   baseURL: API_URL,
@@ -31,7 +31,8 @@ api.interceptors.response.use(
     if (error.response?.status === 401) {
       localStorage.removeItem('access_token')
       delete api.defaults.headers.common['Authorization']
-      window.location.href = '/login'
+      // Dispatch custom event instead of window.location.href for SPA navigation
+      window.dispatchEvent(new CustomEvent('auth:logout'))
     }
     return Promise.reject(error)
   }

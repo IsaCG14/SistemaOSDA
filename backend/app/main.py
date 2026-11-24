@@ -1,46 +1,29 @@
 """
-Backend FastAPI Application
-Main entry point for the Office Secretary Document Agent API.
+FastAPI main application for Office Secretary Document Agent.
 """
 from contextlib import asynccontextmanager
-from typing import Optional, Dict
-from datetime import datetime
+from typing import Optional
+from datetime import datetime, date
 import os
+import re
 import logging
 import httpx
 import psycopg
-
-from fastapi import FastAPI, Request, Depends, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import uuid
+import base64
 import structlog
-from app.services.vision_ocr import get_vision_processor
+import asyncio
+from fastapi import FastAPI, Request, HTTPException, Depends, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+from jose import jwt as jose_jwt, JWTError
+import hmac
 
-# Configurar structlog
-structlog.configure(
-    processors=[
-        structlog.stdlib.filter_by_level,
-        structlog.stdlib.add_logger_name,
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.PositionalArgumentsFormatter(),
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.processors.JSONRenderer()
-    ],
-    context_class=dict,
-    logger_factory=structlog.stdlib.LoggerFactory(),
-    wrapper_class=structlog.stdlib.BoundLogger,
-    cache_logger_on_first_use=True,
-)
-
+# Configuración de logging
 logger = structlog.get_logger()
 
-# Configure standard logging to DEBUG level
-import logging
-logging.basicConfig(level=logging.DEBUG)
+# Configure standard logging
 logging.getLogger("app").setLevel(logging.DEBUG)
 logging.getLogger("httpx").setLevel(logging.DEBUG)
 logging.getLogger("httpcore").setLevel(logging.DEBUG)
@@ -50,138 +33,167 @@ ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "http://supabase-kong:8000")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-GRAPHIFY_URL = os.getenv("GRAPHIFY_URL", "http://graphify:8080")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434")
-VISION_MODEL = os.getenv("VISION_MODEL", "llava:latest")
 SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
+OSDA_BOT_SERVICE_KEY = os.getenv("OSDA_BOT_SERVICE_KEY", "")
+BACKUP_DIR = os.getenv("BACKUP_DIR", "/backups")
+BACKUP_SCRIPT = os.getenv("BACKUP_SCRIPT", "/scripts/backup.sh")
+RESTORE_SCRIPT = os.getenv("RESTORE_SCRIPT", "/scripts/restore.sh")
 
-# Cliente HTTP global para Supabase (PostgREST via Kong)
+# Clientes HTTP globales
 supabase_http_client: Optional[httpx.AsyncClient] = None
 graphify_client: Optional[httpx.AsyncClient] = None
 
 
+# Modelos Pydantic
+class DocumentoCreate(BaseModel):
+    correlativo: str
+    tipo_doc_codigo: str
+    oficina_origen_sigla: str
+    oficina_destino_sigla: str
+    fecha_documento: str
+    fecha_recepcion: Optional[str] = None
+    remitente: Optional[str] = None
+    destinatario: Optional[str] = None
+    asunto: Optional[str] = None
+    folios: Optional[int] = None
+    anexos: Optional[list] = None
+    observaciones: Optional[str] = None
+    estado: str = "RECIBIDO"
+    prioridad: str = "NORMAL"
+    confianza_ocr: Optional[float] = None
+    telegram_user_id: Optional[int] = None
+
+
+class DocumentoResponse(BaseModel):
+    id: str
+    correlativo: str
+    tipo_doc_codigo: str
+    oficina_origen_sigla: str
+    oficina_destino_sigla: str
+    fecha_documento: str
+    fecha_recepcion: Optional[str] = None
+    remitente: Optional[str] = None
+    destinatario: Optional[str] = None
+    asunto: Optional[str] = None
+    folios: Optional[int] = None
+    anexos: list = []
+    estado: str
+    prioridad: str
+    observaciones: Optional[str] = None
+    confianza_ocr: Optional[float] = None
+    telegram_user_id: Optional[int] = None
+    creado_en: str
+    actualizado_en: str
+    creado_por: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+        # Ignorar campos extra que no están en el modelo
+        extra = "ignore"
+
+
+class ConfiguracionGeneral(BaseModel):
+    sitio_nombre: str
+    sitio_url: str
+    zona_horaria: str
+    idioma: str
+    tamano_maximo_subida: int
+    tipos_permitidos: str
+    retencion_dias: int
+    bucket_storage: str
+
+
+class UsuarioCreate(BaseModel):
+    nombre: str
+    email: str
+    password: str
+    cargo: Optional[str] = None
+    oficina_sigla: str
+    telegram_user_id: Optional[int] = None
+    username: Optional[str] = None
+    role: str = "SECRETARIO"
+    activa: bool = True
+
+
+class UsuarioUpdate(BaseModel):
+    password: Optional[str] = None
+    role: Optional[str] = None
+    nombre: Optional[str] = None
+    email: Optional[str] = None
+    cargo: Optional[str] = None
+    oficina_sigla: Optional[str] = None
+    telegram_user_id: Optional[int] = None
+    username: Optional[str] = None
+    activa: Optional[bool] = None
+
+
+class AuthenticatedUser(BaseModel):
+    id: Optional[str] = None
+    email: Optional[str] = None
+    role: str
+    oficina_sigla: Optional[str] = None
+    is_service: bool = False
+
+
+# Lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Gestión del ciclo de vida de la aplicación."""
-    global graphify_client, supabase_http_client
+    global supabase_http_client, graphify_client
 
     logger.info("starting_application", environment=ENVIRONMENT)
 
+    # Validar variables críticas al startup
+    if not SUPABASE_DB_PASSWORD:
+        logger.error("SUPABASE_DB_PASSWORD no configurada - fallará autenticación")
+
     # Inicializar cliente HTTP para Supabase (PostgREST via Kong)
-    try:
-        supabase_http_client = httpx.AsyncClient(
-            base_url=SUPABASE_URL,
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            timeout=30.0,
-        )
-        logger.info("supabase_http_client_initialized")
-    except Exception as e:
-        logger.error("supabase_http_client_failed", error=str(e))
+    supabase_http_client = httpx.AsyncClient(
+        base_url=SUPABASE_URL,
+        headers={
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        timeout=30.0,
+    )
 
-    # Verificar Graphify
-    try:
-        graphify_client = httpx.AsyncClient(
-            base_url=GRAPHIFY_URL,
-            timeout=5.0,
-        )
-        resp = await graphify_client.get("/health")
-        if resp.status_code == 200:
-            logger.info("graphify_connected")
-        else:
-            logger.warning("graphify_unhealthy", status=resp.status_code)
-    except Exception as e:
-        logger.warning("graphify_connection_failed", error=str(e))
-
-    # Verificar Ollama
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{OLLAMA_URL}/api/tags", timeout=5)
-            if resp.status_code == 200:
-                models = resp.json().get("models", [])
-                model_names = [m["name"] for m in models]
-                if VISION_MODEL in model_names:
-                    logger.info("vision_model_available", model=VISION_MODEL)
-                else:
-                    logger.warning("vision_model_not_found", model=VISION_MODEL, available=model_names)
-            else:
-                logger.warning("ollama_unhealthy", status=resp.status_code)
-    except Exception as e:
-        logger.warning("ollama_connection_failed", error=str(e))
+    # Inicializar cliente Graphify
+    graphify_client = httpx.AsyncClient(
+        base_url="http://graphify:8080",
+        timeout=30.0,
+    )
 
     yield
 
     # Cleanup
-    if supabase_http_client:
-        await supabase_http_client.aclose()
-    if graphify_client:
-        await graphify_client.aclose()
-
-    logger.info("shutting_down_application")
+    await supabase_http_client.aclose()
+    await graphify_client.aclose()
+    logger.info("application_shutdown")
 
 
 app = FastAPI(
-    title="Office Secretary Document Agent API",
-    description="API para gestión documental y consultas de secretaría",
+    title="Office Secretary Document Agent",
+    description="API para gestión documental OSDA",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/docs" if ENVIRONMENT == "development" else None,
-    redoc_url="/redoc" if ENVIRONMENT == "development" else None,
 )
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost",
-        "http://localhost:5173",
-        "http://127.0.0.1",
-        "http://127.0.0.1:5173",
-        "http://192.168.251.203",
-        "http://corpocentro.osda.net",
-    ] if ENVIRONMENT == "development" else ["https://docs.corposcentro.local"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Total-Count"],
+    expose_headers=["X-Total-Count", "Content-Range"],
 )
 
-# ─────────────────────────────────────────────────────────────────
-# MIDDLEWARE
-# ─────────────────────────────────────────────────────────────────
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    """Log all requests with structlog."""
-    start_time = structlog.processors.TimeStamper(fmt="iso")
-    logger.info(
-        "request_started",
-        method=request.method,
-        url=str(request.url),
-        client=request.client.host if request.client else None,
-    )
-
-    response = await call_next(request)
-
-    logger.info(
-        "request_completed",
-        method=request.method,
-        url=str(request.url),
-        status_code=response.status_code,
-    )
-    return response
-
-
-# ─────────────────────────────────────────────────────────────────
-# DEPENDENCIAS
-# ─────────────────────────────────────────────────────────────────
-
+# Dependencias
 async def get_supabase_client() -> httpx.AsyncClient:
     if supabase_http_client is None:
-        raise HTTPException(status_code=503, detail="Supabase no disponible")
+        raise HTTPException(status_code=503, detail="Cliente Supabase no disponible")
     return supabase_http_client
 
 
@@ -192,325 +204,304 @@ async def get_graphify_client() -> httpx.AsyncClient:
 
 
 async def get_user_office(request: Request) -> Optional[str]:
-    """
-    Retorna oficina_sigla del usuario autenticado.
-    None si es ADMIN (ve todo).
-    """
+    """Obtiene la oficina del usuario autenticado (None para ADMIN)."""
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     if not auth or not auth.lower().startswith("bearer "):
         return None
-    
+
     token = auth.split(" ", 1)[1].strip()
     try:
-        from jose import jwt as jose_jwt
         from app.core.config import settings
-        payload = jose_jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-        user_email = payload.get("email")
-        # El rol ADMIN está en user_metadata.role (no en el claim 'role' estándar de JWT)
-        user_role = payload.get("user_metadata", {}).get("role") or payload.get("role")
-        
-        # ADMIN ve todo
-        if user_role == "ADMIN":
+        if not settings.SUPABASE_JWT_SECRET:
             return None
-        
-        if user_email:
-            # Buscar persona por email -> oficina_sigla
-            client = supabase_http_client
-            if client:
-                result = await client.get(f"/rest/v1/personas?email=eq.{user_email}&select=oficina_sigla")
-                if result.status_code == 200 and result.json():
-                    return result.json()[0]["oficina_sigla"]
+        payload = jose_jwt.decode(
+            token,
+            settings.SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False, "verify_exp": True},
+        )
+        email = payload.get("email")
+        if not email or supabase_http_client is None:
+            return None
+
+        result = await supabase_http_client.get(
+            "/rest/v1/personas",
+            params={"email": f"eq.{email}", "select": "oficina_sigla", "limit": 1},
+        )
+        if result.status_code == 200 and result.json():
+            return result.json()[0].get("oficina_sigla")
     except Exception:
         pass
     return None
 
 
-async def get_user_office_and_role(request: Request) -> tuple[Optional[str], Optional[str]]:
-    """
-    Retorna (oficina_sigla, role) del usuario autenticado.
-    oficina_sigla = None si es ADMIN.
-    role = 'ADMIN' | 'SECRETARIO' | None
-    """
+async def get_user_office_and_role(request: Request) -> tuple:
+    """Obtiene (oficina_sigla, role) del usuario autenticado."""
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     if not auth or not auth.lower().startswith("bearer "):
-        return (None, None)
-    
+        raise HTTPException(status_code=401, detail="Autenticación requerida")
+
     token = auth.split(" ", 1)[1].strip()
     try:
-        from jose import jwt as jose_jwt
         from app.core.config import settings
-        payload = jose_jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-        user_email = payload.get("email")
-        user_role = payload.get("user_metadata", {}).get("role") or payload.get("role")
-        
-        # ADMIN ve todo
-        if user_role == "ADMIN":
-            return (None, "ADMIN")
-        
-        if user_email:
-            client = supabase_http_client
-            if client:
-                result = await client.get(f"/rest/v1/personas?email=eq.{user_email}&select=oficina_sigla")
-                if result.status_code == 200 and result.json():
-                    oficina = result.json()[0]["oficina_sigla"]
-                    return (oficina, user_role or "SECRETARIO")
-    except Exception:
-        pass
-    return (None, None)
+        if not settings.SUPABASE_JWT_SECRET:
+            raise HTTPException(status_code=503, detail="Validación JWT no configurada")
+        payload = jose_jwt.decode(
+            token,
+            settings.SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False, "verify_exp": True},
+        )
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    email = payload.get("email")
+    if not email or supabase_http_client is None:
+        raise HTTPException(status_code=401, detail="Usuario no válido")
+
+    result = await supabase_http_client.get(
+        "/rest/v1/personas",
+        params={"email": f"eq.{email}", "select": "id,email,activa,oficina_sigla", "limit": 1},
+    )
+    if result.status_code != 200 or not result.json():
+        raise HTTPException(status_code=403, detail="Usuario sin permisos en OSDA")
+
+    persona = result.json()[0]
+    if not persona.get("activa", False):
+        raise HTTPException(status_code=403, detail="Usuario inactivo")
+
+    # El rol se obtiene de user_metadata del JWT verificado
+    role = payload.get("user_metadata", {}).get("role")
+    if not role:
+        role = payload.get("role")
+    if not role:
+        # Fallback: consultar BD si no viene en token (tokens viejos)
+        try:
+            with psycopg.connect(
+                host="supabase-db", dbname="postgres", user="postgres",
+                password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5,
+            ) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT raw_user_meta_data->>'role' FROM auth.users WHERE lower(email) = lower(%s)",
+                        (email,),
+                    )
+                    row = cursor.fetchone()
+                    role = row[0] if row else None
+        except psycopg.Error as error:
+            logger.error("auth_role_lookup_failed", error=str(error))
+            raise HTTPException(status_code=503, detail="No se pudo validar el rol")
+
+    if role not in ("ADMIN", "SECRETARIO"):
+        raise HTTPException(status_code=403, detail="Rol no autorizado")
+
+    return (persona.get("oficina_sigla"), role)
+
+
+async def get_current_user(request: Request) -> AuthenticatedUser:
+    """Autenticar JWT de GoTrue o la clave exclusiva del bot."""
+    # Verificar clave de servicio del bot
+    service_key = os.getenv("OSDA_BOT_SERVICE_KEY", "")
+    supplied_key = request.headers.get("x-osda-service-key", "")
+    if service_key and supplied_key:
+        if hmac.compare_digest(service_key, supplied_key):
+            return AuthenticatedUser(role="BOT", is_service=True)
+        raise HTTPException(status_code=401, detail="Credencial de servicio inválida")
+
+    # La anon key identifica a Supabase, no autoriza operaciones de OSDA
+    if request.headers.get("apikey") == os.getenv("SUPABASE_ANON_KEY", ""):
+        raise HTTPException(status_code=401, detail="La anon key no autoriza esta API")
+
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Autenticación requerida")
+
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        from app.core.config import settings
+        if not settings.SUPABASE_JWT_SECRET:
+            raise HTTPException(status_code=503, detail="Validación JWT no configurada")
+        payload = jose_jwt.decode(
+            token,
+            settings.SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False, "verify_exp": True},
+        )
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+
+    email = payload.get("email")
+    if not email or supabase_http_client is None:
+        raise HTTPException(status_code=401, detail="Usuario no válido")
+
+    result = await supabase_http_client.get(
+        "/rest/v1/personas",
+        params={"email": f"eq.{email}", "select": "id,email,activa,oficina_sigla", "limit": 1},
+    )
+    if result.status_code != 200 or not result.json():
+        raise HTTPException(status_code=403, detail="Usuario sin permisos en OSDA")
+
+    persona = result.json()[0]
+    if not persona.get("activa", False):
+        raise HTTPException(status_code=403, detail="Usuario inactivo")
+
+    # El rol se obtiene de user_metadata del JWT verificado
+    role = payload.get("user_metadata", {}).get("role")
+    if not role:
+        role = payload.get("role")
+    if not role:
+        # Fallback: consultar BD si no viene en token (tokens viejos)
+        try:
+            with psycopg.connect(
+                host="supabase-db", dbname="postgres", user="postgres",
+                password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5,
+            ) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT raw_user_meta_data->>'role' FROM auth.users WHERE lower(email) = lower(%s)",
+                        (email,),
+                    )
+                    row = cursor.fetchone()
+                    role = row[0] if row else None
+        except psycopg.Error as error:
+            logger.error("auth_role_lookup_failed", error=str(error))
+            raise HTTPException(status_code=503, detail="No se pudo validar el rol")
+
+    if role not in ("ADMIN", "SECRETARIO"):
+        raise HTTPException(status_code=403, detail="Rol no autorizado")
+
+    return AuthenticatedUser(
+        id=persona.get("id"),
+        email=persona.get("email"),
+        role=role,
+        oficina_sigla=persona.get("oficina_sigla"),
+    )
+
+
+async def _verify_admin_role(request: Request) -> str:
+    """Verifica que el usuario sea ADMIN usando el rol del JWT."""
+    from app.core.config import settings
+
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="No autorizado")
+
+    token = auth.split(" ", 1)[1].strip()
+    try:
+        if not settings.SUPABASE_JWT_SECRET:
+            raise HTTPException(status_code=503, detail="Validación JWT no configurada")
+        payload = jose_jwt.decode(
+            token,
+            settings.SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"verify_aud": False, "verify_exp": True},
+        )
+        # GoTrue pone el rol de la aplicación en user_metadata.role
+        user_role = payload.get("user_metadata", {}).get("role")
+        if not user_role:
+            # Fallback: claim "role" estándar (puede ser "authenticated" en GoTrue)
+            user_role = payload.get("role")
+
+        if user_role != "ADMIN":
+            raise HTTPException(status_code=403, detail="Solo un ADMIN puede acceder a personas")
+
+        return user_role
+
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+    except Exception as e:
+        logger.error("_verify_admin_role_failed", error=str(e))
+        raise HTTPException(status_code=401, detail="Error verificando token")
 
 
 # ─────────────────────────────────────────────────────────────────
-# MODELOS
+# ENDPOINT - HEALTH CHECK
 # ─────────────────────────────────────────────────────────────────
-
-class HealthResponse(BaseModel):
-    status: str
-    environment: str
-    version: str = "1.0.0"
-    supabase: str
-    graphify: str
-    ollama: str
-
-
-class DocumentoCreate(BaseModel):
-    correlativo: str
-    tipo_doc_codigo: str
-    oficina_origen_sigla: str
-    oficina_destino_sigla: str
-    fecha_documento: str
-    fecha_recepcion: Optional[str] = None
-    remitente_id: Optional[str] = None
-    destinatario_id: Optional[str] = None
-    remitente: Optional[str] = None
-    destinatario: Optional[str] = None
-    asunto: Optional[str] = None
-    folios: Optional[int] = None
-    anexos: list = []
-    estado: str = "RECIBIDO"
-    prioridad: str = "NORMAL"
-    observaciones: Optional[str] = None
-    confianza_ocr: Optional[float] = None
-
-
-class DocumentoResponse(DocumentoCreate):
-    id: str
-    creado_en: str
-    actualizado_en: Optional[str] = None
-    creado_por: Optional[str] = None
-
-
-# ─────────────────────────────────────────────────────────────────
-# MODELOS - OFICINAS Y TIPOS DOCUMENTO
-# ─────────────────────────────────────────────────────────────────
-
-class OficinaCreate(BaseModel):
-    sigla: str
-    nombre: str
-    activa: bool = True
-
-
-class OficinaResponse(OficinaCreate):
-    sigla: str
-    nombre: str
-    activa: bool
-
-
-class TipoDocumentoCreate(BaseModel):
-    codigo: str
-    nombre: str
-    prefijo_correlativo: str
-    regla_secuencial: dict
-    plazo_dias_respuesta: int
-    requiere_anexos: bool
-
-
-class TipoDocumentoResponse(TipoDocumentoCreate):
-    codigo: str
-    nombre: str
-    prefijo_correlativo: str
-    regla_secuencial: dict
-    plazo_dias_respuesta: int
-    requiere_anexos: bool
-
-
-class VisionRequest(BaseModel):
-    file_path: str
-    mime_type: str
-
-
-class VisionResponse(BaseModel):
-    success: bool
-    data: Optional[dict] = None
-    error: Optional[str] = None
-    confidence: Optional[float] = None
-
-
-# ─────────────────────────────────────────────────────────────────
-# ENDPOINTS - HEALTH
-# ─────────────────────────────────────────────────────────────────
-
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    from app.core.config import settings
+
     # Verificar Supabase
     supabase_status = "disconnected"
-    if supabase_http_client:
-        try:
-            resp = await supabase_http_client.get("/rest/v1/documentos?select=id&limit=1")
-            if resp.status_code == 200:
-                supabase_status = "connected"
-        except:
-            pass
-
-    # Verificar Graphify
-    graphify_status = "disconnected"
     try:
-        resp = await graphify_client.get("/health")
-        if resp.status_code == 200:
-            graphify_status = "connected"
-    except:
+        if supabase_http_client:
+            r = await supabase_http_client.get("/rest/v1/", timeout=5)
+            if r.status_code == 200:
+                supabase_status = "connected"
+    except Exception:
         pass
+
+    # Verificar NVIDIA API (Vision) - solo si es el proveedor configurado
+    nvidia_status = "not_configured"
+    if settings.VISION_PROVIDER == "nvidia" and settings.NVIDIA_API_KEY:
+        try:
+            async with httpx.AsyncClient() as c:
+                r = await c.get(
+                    "https://integrate.api.nvidia.com/v1/models",
+                    headers={"Authorization": f"Bearer {settings.NVIDIA_API_KEY}"},
+                    timeout=5,
+                )
+                if r.status_code == 200:
+                    nvidia_status = "connected"
+        except Exception:
+            pass
+    elif settings.VISION_PROVIDER == "ollama":
+        nvidia_status = "using_ollama"
 
     # Verificar Ollama
     ollama_status = "disconnected"
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{OLLAMA_URL}/api/tags", timeout=3)
-            if resp.status_code == 200:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{settings.OLLAMA_URL}/api/tags", timeout=5)
+            if r.status_code == 200:
                 ollama_status = "connected"
-    except:
+    except Exception:
         pass
 
-    return HealthResponse(
-        status="healthy" if all(s == "connected" for s in [supabase_status, graphify_status, ollama_status]) else "degraded",
-        environment=ENVIRONMENT,
-        supabase=supabase_status,
-        graphify=graphify_status,
-        ollama=ollama_status,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────
-# ENDPOINTS - DOCUMENTOS
-# ─────────────────────────────────────────────────────────────────
-
-@app.post("/api/documentos", response_model=DocumentoResponse, status_code=201)
-async def create_documento(
-    doc: DocumentoCreate, 
-    request: Request, 
-    user_info: tuple = Depends(get_user_office_and_role),
-    client: httpx.AsyncClient = Depends(get_supabase_client)
-):
-    """Crear documento en Supabase e indexar en Graphify.
-    
-    Para SECRETARIO: oficina_origen_sigla se fuerza a su oficina.
-    Para ADMIN: respeta lo enviado en el payload.
-    """
-    import uuid
-    from datetime import datetime
-    
-    user_office, user_role = user_info
-    
-    # Obtener usuario autenticado (creado_por)
-    creado_por = None
-    auth = request.headers.get("authorization") or request.headers.get("Authorization")
-    if auth and auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-        try:
-            from jose import jwt as jose_jwt, JWTError
-            from app.core.config import settings
-            payload = jose_jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-            user_email = payload.get("email")
-            if user_email:
-                persona_result = await client.get(f"/rest/v1/personas?email=eq.{user_email}&select=id")
-                if persona_result.status_code == 200 and persona_result.json():
-                    creado_por = persona_result.json()[0]["id"]
-        except Exception:
-            pass
-
-    # Si viene telegram_user_id del bot, usarlo para buscar persona
-    telegram_user_id = doc.model_dump().get("telegram_user_id")
-    if telegram_user_id and not creado_por:
-        persona_result = await client.get(f"/rest/v1/personas?telegram_user_id=eq.{telegram_user_id}&select=id")
-        if persona_result.status_code == 200 and persona_result.json():
-            creado_por = persona_result.json()[0]["id"]
-
-    # Validar y forzar oficina_origen según rol
-    if user_role == "ADMIN":
-        # ADMIN: respeta lo enviado en el payload
-        pass
-    else:
-        # SECRETARIO: forzar oficina_origen_sigla a su oficina
-        if not user_office:
-            raise HTTPException(status_code=403, detail="Usuario sin oficina asignada")
-        doc.oficina_origen_sigla = user_office
-
-    # Verificar si ya existe el correlativo
-    check_result = await client.get(f"/rest/v1/documentos?correlativo=eq.{doc.correlativo}&select=id")
-    if check_result.status_code == 200 and check_result.json():
-        existing = check_result.json()[0]
-        raise HTTPException(status_code=409, detail=f"El documento con correlativo '{doc.correlativo}' ya existe (ID: {existing['id']})")
-
-    doc_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
-
-    data = doc.model_dump()
-    data.update({
-        "id": doc_id,
-        "creado_en": now,
-        "actualizado_en": now,
-        "creado_por": creado_por,
-    })
-
+    # Verificar Graphify
+    graphify_status = "disconnected"
     try:
-        result = await client.post(
-            "/rest/v1/documentos", 
-            json=data,
-            headers={"Prefer": "return=representation"}
-        )
-        result.raise_for_status()
-        created = result.json()
-        
-        # Indexar en Graphify (async, no bloquear)
-        try:
-            if graphify_client:
-                # Graphify espera el esquema viejo (tipo_documento, oficina_origen):
-                # se traduce desde el esquema actual (tipo_doc_codigo, *_sigla)
-                graphify_payload = {
-                    "id": doc_id,
-                    "correlativo": data["correlativo"],
-                    "tipo_documento": data["tipo_doc_codigo"],
-                    "oficina_origen": data["oficina_origen_sigla"],
-                    "oficina_destino": data["oficina_destino_sigla"],
-                    "fecha_documento": data["fecha_documento"],
-                    "fecha_recepcion": data.get("fecha_recepcion"),
-                    "remitente": data.get("remitente"),
-                    "destinatario": data.get("destinatario"),
-                    "asunto": data.get("asunto"),
-                    "folios": data.get("folios"),
-                    "anexos": data.get("anexos") or [],
-                    "estado": data.get("estado", "RECIBIDO"),
-                    "prioridad": data.get("prioridad", "NORMAL"),
-                    "observaciones": data.get("observaciones"),
-                    "confianza_ocr": data.get("confianza_ocr"),
-                }
-                await graphify_client.post("/documentos", json=graphify_payload, timeout=10)
-        except Exception as e:
-            logger.warning("graphify_index_failed", error=str(e), doc_id=doc_id)
-        
-        return DocumentoResponse(**created[0])
-    except httpx.HTTPStatusError as e:
-        logger.error("create_documento_failed", error=str(e), response=e.response.text)
-        raise HTTPException(status_code=500, detail=f"Error insertando documento: {e.response.text}")
-    except Exception as e:
-        logger.error("create_documento_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        if graphify_client:
+            r = await graphify_client.get("/health", timeout=5)
+            if r.status_code == 200:
+                graphify_status = "connected"
+    except Exception:
+        pass
+
+    # Verificar BD
+    db_status = "disconnected"
+    try:
+        with psycopg.connect(
+            host="supabase-db", dbname="postgres", user="postgres",
+            password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                db_status = "connected"
+    except Exception:
+        pass
+
+    overall = "healthy" if all(
+        s in ("connected", "using_ollama") for s in [supabase_status, db_status, ollama_status, graphify_status]
+    ) else "degraded"
+
+    return {
+        "status": overall,
+        "services": {
+            "supabase": supabase_status,
+            "database": db_status,
+            "ollama": ollama_status,
+            "nvidia_vision": nvidia_status,
+            "graphify": graphify_status,
+        },
+        "version": "1.0.0",
+        "environment": ENVIRONMENT,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────
-# ENDPOINT - MÉTRICAS DASHBOARD (DEBE IR ANTES DE /api/documentos/{doc_id})
+# ENDPOINT - MÉTRICAS DASHBOARD
 # ─────────────────────────────────────────────────────────────────
-
 @app.get("/api/documentos/metricas")
 async def get_metricas(
     request: Request,
@@ -519,7 +510,7 @@ async def get_metricas(
     fecha_hasta: Optional[str] = None,
     tipo_documento: Optional[str] = None,
     user_office: Optional[str] = Depends(get_user_office),
-    client: httpx.AsyncClient = Depends(get_supabase_client)
+    client: httpx.AsyncClient = Depends(get_supabase_client),
 ):
     """Obtener métricas para el dashboard. Filtrado automático por oficina del usuario (SECRETARIO)."""
     try:
@@ -527,7 +518,7 @@ async def get_metricas(
         params = [
             ("select", "estado,fecha_documento,oficina_origen_sigla,tipo_doc_codigo,eliminado_en"),
         ]
-        
+
         # Filtrado automático por oficina del usuario (SECRETARIO)
         if user_office:
             # Filtrar: origen = user_office OR destino = user_office
@@ -536,79 +527,83 @@ async def get_metricas(
             # ADMIN: aplicar filtros manuales si se proporcionaron
             if oficina_origen:
                 params.append(("oficina_origen_sigla", f"eq.{oficina_origen}"))
-        
+
         if tipo_documento:
             params.append(("tipo_doc_codigo", f"eq.{tipo_documento}"))
         if fecha_desde and fecha_hasta:
-            # Ambos: usar dos parámetros separados (PostgREST los trata como AND)
             params.append(("fecha_documento", f"gte.{fecha_desde}"))
             params.append(("fecha_documento", f"lte.{fecha_hasta}"))
         elif fecha_desde:
             params.append(("fecha_documento", f"gte.{fecha_desde}"))
         elif fecha_hasta:
             params.append(("fecha_documento", f"lte.{fecha_hasta}"))
-        
+
         # EXCLUIR documentos eliminados (soft delete)
         params.append(("eliminado_en", "is.null"))
-        
+
+        # Construir filtro de oficina base para reutilizar
+        oficina_filter = None
+        if user_office:
+            oficina_filter = ("or", f"(oficina_origen_sigla.eq.{user_office},oficina_destino_sigla.eq.{user_office})")
+        elif oficina_origen:
+            oficina_filter = ("oficina_origen_sigla", f"eq.{oficina_origen}")
+
+        if oficina_filter:
+            params.append(oficina_filter)
+
         # Obtener todos los documentos para calcular métricas
         result = await client.get("/rest/v1/documentos", params=params)
         result.raise_for_status()
         docs = result.json()
-        
+
         # Calcular métricas
         total = len(docs)
-        
+
         # Por estado
         por_estado = {}
         for doc in docs:
             estado = doc.get("estado", "DESCONOCIDO")
             por_estado[estado] = por_estado.get(estado, 0) + 1
-        
+
         por_estado_list = [
-            {"estado": k, "count": v} 
+            {"estado": k, "count": v}
             for k, v in sorted(por_estado.items(), key=lambda x: x[1], reverse=True)
         ]
-        
+
         # Por oficina origen
         por_oficina = {}
         for doc in docs:
             oficina = doc.get("oficina_origen_sigla", "SIN_OFICINA")
             por_oficina[oficina] = por_oficina.get(oficina, 0) + 1
-        
+
         por_oficina_list = [
-            {"oficina": k, "count": v} 
+            {"oficina": k, "count": v}
             for k, v in sorted(por_oficina.items(), key=lambda x: x[1], reverse=True)
         ]
-        
+
         # Este mes
-        from datetime import datetime, date
         hoy = date.today()
         inicio_mes = date(hoy.year, hoy.month, 1).isoformat()
-        
-        # Crear params frescos para este mes (sin filtros de fecha previos)
+
         params_mes = [("select", "id")]
-        
-        if user_office:
-            params_mes.append(("or", f"(oficina_origen_sigla.eq.{user_office},oficina_destino_sigla.eq.{user_office})"))
-        elif oficina_origen:
-            params_mes.append(("oficina_origen_sigla", f"eq.{oficina_origen}"))
-        
+
+        if oficina_filter:
+            params_mes.append(oficina_filter)
+
         if tipo_documento:
             params_mes.append(("tipo_doc_codigo", f"eq.{tipo_documento}"))
-        
+
         params_mes.append(("fecha_documento", f"gte.{inicio_mes}"))
-        # EXCLUIR documentos eliminados (soft delete)
         params_mes.append(("eliminado_en", "is.null"))
-        
+
         result_mes = await client.get("/rest/v1/documentos", params=params_mes)
         result_mes.raise_for_status()
         docs_mes = result_mes.json()
         este_mes = len(docs_mes)
-        
-        # Oficinas activas (count de oficinas con documentos)
+
+        # Oficinas activas
         oficinas_activas = len(por_oficina)
-        
+
         return {
             "total": total,
             "este_mes": este_mes,
@@ -627,220 +622,220 @@ async def get_metricas(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/documentos/{doc_id}", response_model=DocumentoResponse)
-async def get_documento(
-    doc_id: str, 
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINT - DOCUMENTOS
+# ─────────────────────────────────────────────────────────────────
+@app.post("/api/documentos", response_model=DocumentoResponse, status_code=201)
+async def create_documento(
+    data: DocumentoCreate,
     request: Request,
-    user_info: tuple = Depends(get_user_office_and_role),
-    client: httpx.AsyncClient = Depends(get_supabase_client)
+    user: AuthenticatedUser = Depends(get_current_user),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
 ):
-    """Obtener documento por ID. Verifica acceso por oficina."""
-    user_office, user_role = user_info
-    
+    """Crear nuevo documento."""
+    if user.role == "SECRETARIO" and user.oficina_sigla:
+        if data.oficina_origen_sigla != user.oficina_sigla and data.oficina_destino_sigla != user.oficina_sigla:
+            raise HTTPException(status_code=403, detail="Solo puedes crear documentos de tu oficina")
+
     try:
-        result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}")
+        payload = data.model_dump()
+        payload["creado_por"] = user.id
+        payload["actualizado_por"] = user.id
+
+        result = await client.post("/rest/v1/documentos", json=payload, headers={"Prefer": "return=representation"})
         result.raise_for_status()
-        data = result.json()
-        if not data:
-            raise HTTPException(status_code=404, detail="Documento no encontrado")
-        
-        doc = data[0]
-        
-        # Verificar acceso: ADMIN ve todo, SECRETARIO solo su oficina (origen OR destino)
-        if user_role != "ADMIN":
-            user_office = None
-            auth = request.headers.get("authorization") or request.headers.get("Authorization")
-            if auth and auth.lower().startswith("bearer "):
-                token = auth.split(" ", 1)[1].strip()
-                try:
-                    from jose import jwt as jose_jwt
-                    from app.core.config import settings
-                    payload = jose_jwt.decode(token, settings.SUPABASE_JWT_SECRET, algorithms=["HS256"], options={"verify_aud": False})
-                    user_email = payload.get("email")
-                    if user_email:
-                        client_local = supabase_http_client
-                        if client_local:
-                            result = await client_local.get(f"/rest/v1/personas?email=eq.{user_email}&select=oficina_sigla")
-                            if result.status_code == 200 and result.json():
-                                user_office = result.json()[0]["oficina_sigla"]
-                except Exception:
-                    pass
-            
-            if user_office:
-                doc_oficina_origen = doc.get("oficina_origen_sigla")
-                doc_oficina_destino = doc.get("oficina_destino_sigla")
-                if doc_oficina_origen != user_office and doc_oficina_destino != user_office:
-                    raise HTTPException(status_code=403, detail="No tiene acceso a este documento")
-        
-        return DocumentoResponse(**doc)
+        created = result.json()
+
+        # Indexar en Graphify
+        try:
+            if graphify_client:
+                doc_id = created[0]["id"]
+                graphify_payload = {
+                    "id": doc_id,
+                    "correlativo": data.correlativo,
+                    "tipo_documento": data.tipo_doc_codigo,
+                    "oficina_origen": data.oficina_origen_sigla,
+                    "oficina_destino": data.oficina_destino_sigla,
+                    "fecha_documento": data.fecha_documento,
+                    "fecha_recepcion": data.fecha_recepcion,
+                    "remitente": data.remitente,
+                    "destinatario": data.destinatario,
+                    "asunto": data.asunto,
+                    "folios": data.folios,
+                    "anexos": data.anexos or [],
+                    "estado": data.estado,
+                    "prioridad": data.prioridad,
+                    "observaciones": data.observaciones,
+                    "confianza_ocr": data.confianza_ocr,
+                }
+                await graphify_client.post("/documentos", json=graphify_payload, timeout=10)
+        except Exception as e:
+            logger.warning("graphify_index_failed", error=str(e), doc_id=doc_id)
+
+        return DocumentoResponse(**created[0])
     except httpx.HTTPStatusError as e:
-        logger.error("get_documento_failed", error=str(e), doc_id=doc_id)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("create_documento_failed", error=str(e), response=e.response.text)
+        raise HTTPException(status_code=500, detail=f"Error insertando documento: {e.response.text}")
     except Exception as e:
-        logger.error("get_documento_failed", error=str(e), doc_id=doc_id)
+        logger.error("create_documento_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/documentos", response_model=list[DocumentoResponse])
 async def list_documentos(
     request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     search: Optional[str] = None,
-    oficina_origen: Optional[str] = None,
-    oficina_destino: Optional[str] = None,
-    tipo_documento: Optional[str] = None,
     estado: Optional[str] = None,
+    tipo_doc_codigo: Optional[str] = None,
+    oficina_origen_sigla: Optional[str] = None,
+    oficina_destino_sigla: Optional[str] = None,
     fecha_desde: Optional[str] = None,
     fecha_hasta: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0,
-    user_office: Optional[str] = Depends(get_user_office),
-    client: httpx.AsyncClient = Depends(get_supabase_client)
+    order_by: str = "fecha_documento",
+    order_dir: str = "desc",
+    user_info: tuple = Depends(get_user_office_and_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
 ):
-    """Listar documentos con filtros. Filtrado automático por oficina del usuario (SECRETARIO)."""
+    """Listar documentos con filtros y paginación."""
+    user_office, user_role = user_info
+
+    params = {
+        "limit": limit,
+        "offset": offset,
+        "order": f"{order_by}.{order_dir}",
+    }
+
+    # Filtrado por oficina
+    if user_role == "SECRETARIO" and user_office:
+        params["or"] = f"(oficina_origen_sigla.eq.{user_office},oficina_destino_sigla.eq.{user_office})"
+    else:
+        # ADMIN: filtros manuales
+        if oficina_origen_sigla:
+            params["oficina_origen_sigla"] = f"eq.{oficina_origen_sigla}"
+        if oficina_destino_sigla:
+            params["oficina_destino_sigla"] = f"eq.{oficina_destino_sigla}"
+
+    if search:
+        params["or"] = f"(correlativo.ilike.*{search}*,asunto.ilike.*{search}*,remitente.ilike.*{search}*,destinatario.ilike.*{search}*)"
+    if estado:
+        params["estado"] = f"eq.{estado}"
+    if tipo_doc_codigo:
+        params["tipo_doc_codigo"] = f"eq.{tipo_doc_codigo}"
+    if fecha_desde:
+        params["fecha_documento"] = f"gte.{fecha_desde}"
+    if fecha_hasta:
+        # PostgREST no soporta múltiples valores para mismo key, usar dos queries o lte
+        params["fecha_documento"] = f"lte.{fecha_hasta}"
+
+    # Excluir eliminados
+    params["eliminado_en"] = "is.null"
+
     try:
-        # Usar lista de tuplas para permitir parámetros duplicados (AND implícito en PostgREST)
-        params = [
-            ("select", "*"),
-            ("order", "fecha_documento.desc"),
-            ("limit", str(limit)),
-            ("offset", str(offset)),
-        ]
-        
-        # Filtrado automático por oficina del usuario (SECRETARIO)
-        # Si user_office existe (no es ADMIN), filtrar: origen = user_office OR destino = user_office
-        if user_office:
-            # PostgREST OR filter: (oficina_origen_sigla.eq.X,oficina_destino_sigla.eq.X)
-            params.append(("or", f"(oficina_origen_sigla.eq.{user_office},oficina_destino_sigla.eq.{user_office})"))
-        else:
-            # ADMIN: aplicar filtros manuales si se proporcionaron
-            if oficina_origen:
-                params.append(("oficina_origen_sigla", f"eq.{oficina_origen}"))
-            if oficina_destino:
-                params.append(("oficina_destino_sigla", f"eq.{oficina_destino}"))
-        
-        if search:
-            # Busqueda sin acentos sobre search_text (columna generada con unaccent)
-            # Se normaliza el termino en Python (NFD + quitar marcas) para que
-            # "toner" encuentre "tóner", "informe" a "informé", etc.
-            import unicodedata
-            normalized = unicodedata.normalize("NFD", search)
-            term = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-            # '*' es el wildcard de PostgREST; ',()/' son parte de su sintaxis -> se retiran
-            term = "".join(ch for ch in term if ch not in ",()/").strip()
-            if term:
-                like = f"*{term}*"
-                params.append(("search_text", f"ilike.{like}"))
-
-        if oficina_origen:
-            params.append(("oficina_origen_sigla", f"eq.{oficina_origen}"))
-        if oficina_destino:
-            params.append(("oficina_destino_sigla", f"eq.{oficina_destino}"))
-        if tipo_documento:
-            params.append(("tipo_doc_codigo", f"eq.{tipo_documento}"))
-        if estado:
-            params.append(("estado", f"eq.{estado}"))
-        if fecha_desde and fecha_hasta:
-            # Ambos: usar dos parámetros separados (PostgREST los trata como AND)
-            params.append(("fecha_documento", f"gte.{fecha_desde}"))
-            params.append(("fecha_documento", f"lte.{fecha_hasta}"))
-        elif fecha_desde:
-            params.append(("fecha_documento", f"gte.{fecha_desde}"))
-        elif fecha_hasta:
-            params.append(("fecha_documento", f"lte.{fecha_hasta}"))
-        
-        # Para paginación: obtener total count (sin limit/offset)
-        # Hacer query de count con los mismos filtros
-        count_params = [p for p in params if p[0] not in ("limit", "offset", "select", "order")]
-        count_params.append(("select", "count"))
-        count_result = await client.get("/rest/v1/documentos", params=count_params)
-        count_result.raise_for_status()
-        # La respuesta con select=count devuelve [{"count": N}]
-        try:
-            total_count = count_result.json()[0]["count"]
-        except (IndexError, KeyError, TypeError):
-            total_count = 0
-
         result = await client.get("/rest/v1/documentos", params=params)
         result.raise_for_status()
-        data = result.json()
-        
-        # Devolver headers con total count para paginación en frontend
-        from fastapi import Response
-        # No podemos usar Response directamente aquí, pero podemos usar headers en la respuesta
-        # Mejor: usar un header personalizado
-        from fastapi.responses import JSONResponse
-        return JSONResponse(
-            content=[DocumentoResponse(**doc).model_dump() for doc in data],
-            headers={"X-Total-Count": str(total_count)}
-        )
+        return [DocumentoResponse(**doc) for doc in result.json()]
     except httpx.HTTPStatusError as e:
-        logger.error("list_documentos_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("list_documentos_failed", error=str(e), response=e.response.text)
+        raise HTTPException(status_code=500, detail=f"Error listando documentos: {e.response.text}")
     except Exception as e:
         logger.error("list_documentos_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put("/api/documentos/{doc_id}", response_model=DocumentoResponse)
-async def update_documento(
-    doc_id: str, 
-    doc: DocumentoCreate, 
+@app.get("/api/documentos/{doc_id}", response_model=DocumentoResponse)
+async def get_documento(
+    doc_id: str,
     request: Request,
     user_info: tuple = Depends(get_user_office_and_role),
-    client: httpx.AsyncClient = Depends(get_supabase_client)
+    client: httpx.AsyncClient = Depends(get_supabase_client),
 ):
-    """Actualizar documento. Verifica acceso por oficina."""
+    """Obtener documento por ID. Verifica acceso por oficina."""
     user_office, user_role = user_info
-    
-    # Verificar acceso primero
-    check_result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}&select=oficina_origen_sigla,oficina_destino_sigla")
-    check_result.raise_for_status()
-    existing = check_result.json()
-    
-    if not existing:
-        raise HTTPException(status_code=404, detail="Documento no encontrado")
-    
-    # Verificar acceso
-    if user_role != "ADMIN":
-        doc_oficina_origen = existing[0].get("oficina_origen_sigla")
-        doc_oficina_destino = existing[0].get("oficina_destino_sigla")
-        if user_office not in (doc_oficina_origen, doc_oficina_destino):
-            raise HTTPException(status_code=403, detail="No tiene acceso a este documento")
-        
-        # SECRETARIO no puede cambiar oficina_origen
-        if doc.oficina_origen_sigla != user_office:
-            raise HTTPException(status_code=403, detail="No puede cambiar la oficina de origen")
-    
-    from datetime import datetime
 
-    data = doc.model_dump()
-    
-    # Convertir strings vacíos a null para campos opcionales
-    empty_to_null_fields = [
-        "fecha_recepcion", "remitente_id", "destinatario_id",
-        "remitente", "destinatario", "asunto", "observaciones"
-    ]
-    for field in empty_to_null_fields:
-        if data.get(field) == "":
-            data[field] = None
-    
-    # folios: 0 debe ser null (constraint CHECK folios > 0 OR NULL)
-    if data.get("folios") == 0:
-        data["folios"] = None
-    
-    data["actualizado_en"] = datetime.utcnow().isoformat()
-    
     try:
-        result = await client.patch(
-            f"/rest/v1/documentos?id=eq.{doc_id}", 
-            json=data,
-            headers={"Prefer": "return=representation"}
-        )
+        result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}")
         result.raise_for_status()
         data = result.json()
-        if data:
-            return DocumentoResponse(**data[0])
-        raise HTTPException(status_code=404, detail="Documento no encontrado")
+        if not data:
+            raise HTTPException(status_code=404, detail="Documento no encontrado")
+
+        doc = data[0]
+
+        # Verificar acceso: ADMIN ve todo, SECRETARIO solo su oficina (origen OR destino)
+        if user_role != "ADMIN":
+            if doc.get("oficina_origen_sigla") != user_office and doc.get("oficina_destino_sigla") != user_office:
+                raise HTTPException(status_code=403, detail="Sin acceso a este documento")
+
+        return DocumentoResponse(**doc)
+    except httpx.HTTPStatusError as e:
+        logger.error("get_documento_failed", error=str(e), response=e.response.text)
+        raise HTTPException(status_code=500, detail=f"Error obteniendo documento: {e.response.text}")
+    except Exception as e:
+        logger.error("get_documento_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/documentos/{doc_id}", response_model=DocumentoResponse)
+async def update_documento(
+    doc_id: str,
+    data: DocumentoCreate,
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Actualizar documento."""
+    user_office, user_role = user_info
+
+    try:
+        # Verificar existencia y acceso
+        result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}")
+        result.raise_for_status()
+        existing = result.json()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Documento no encontrado")
+
+        doc = existing[0]
+        if user_role != "ADMIN":
+            if doc.get("oficina_origen_sigla") != user_office and doc.get("oficina_destino_sigla") != user_office:
+                raise HTTPException(status_code=403, detail="Sin acceso a este documento")
+
+        # Actualizar
+        payload = data.model_dump()
+        payload["actualizado_por"] = user_office  # o user.id si se pasa
+        payload["actualizado_en"] = datetime.utcnow().isoformat()
+
+        result = await client.patch(f"/rest/v1/documentos?id=eq.{doc_id}", json=payload, headers={"Prefer": "return=representation"})
+        result.raise_for_status()
+        updated = result.json()
+
+        # Re-indexar en Graphify
+        try:
+            if graphify_client:
+                graphify_payload = {
+                    "id": doc_id,
+                    "correlativo": data.correlativo,
+                    "tipo_documento": data.tipo_doc_codigo,
+                    "oficina_origen": data.oficina_origen_sigla,
+                    "oficina_destino": data.oficina_destino_sigla,
+                    "fecha_documento": data.fecha_documento,
+                    "fecha_recepcion": data.fecha_recepcion,
+                    "remitente": data.remitente,
+                    "destinatario": data.destinatario,
+                    "asunto": data.asunto,
+                    "folios": data.folios,
+                    "anexos": data.anexos or [],
+                    "estado": data.estado,
+                    "prioridad": data.prioridad,
+                    "observaciones": data.observaciones,
+                    "confianza_ocr": data.confianza_ocr,
+                }
+                await graphify_client.patch(f"/documentos/{doc_id}", json=graphify_payload, timeout=10)
+        except Exception as e:
+            logger.warning("graphify_update_failed", error=str(e), doc_id=doc_id)
+
+        return DocumentoResponse(**updated[0])
     except httpx.HTTPStatusError as e:
         logger.error("update_documento_failed", error=str(e), response=e.response.text)
         raise HTTPException(status_code=500, detail=f"Error actualizando documento: {e.response.text}")
@@ -851,960 +846,128 @@ async def update_documento(
 
 @app.delete("/api/documentos/{doc_id}")
 async def delete_documento(
-    doc_id: str, 
+    doc_id: str,
     request: Request,
     user_info: tuple = Depends(get_user_office_and_role),
-    client: httpx.AsyncClient = Depends(get_supabase_client)
+    client: httpx.AsyncClient = Depends(get_supabase_client),
 ):
-    """Eliminar documento: si está ARCHIVADO -> borrado permanente, sino -> marcar como ARCHIVADO.
-    Verifica acceso por oficina."""
+    """Eliminar documento (soft delete)."""
     user_office, user_role = user_info
-    
-    from datetime import datetime
-    
+
     try:
-        # Primero verificar el estado actual del documento y oficina
-        check_result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}&select=estado,oficina_origen_sigla,oficina_destino_sigla")
-        check_result.raise_for_status()
-        existing = check_result.json()
-        
+        result = await client.get(f"/rest/v1/documentos?id=eq.{doc_id}")
+        result.raise_for_status()
+        existing = result.json()
         if not existing:
             raise HTTPException(status_code=404, detail="Documento no encontrado")
-        
-        # Verificar acceso
+
+        doc = existing[0]
         if user_role != "ADMIN":
-            doc_oficina_origen = existing[0].get("oficina_origen_sigla")
-            doc_oficina_destino = existing[0].get("oficina_destino_sigla")
-            if user_office not in (doc_oficina_origen, doc_oficina_destino):
-                raise HTTPException(status_code=403, detail="No tiene acceso a este documento")
-        
-        current_estado = existing[0].get("estado", "")
-        
-        if current_estado == "ARCHIVADO":
-            # BORRADO PERMANENTE (hard delete)
-            result = await client.delete(
-                f"/rest/v1/documentos?id=eq.{doc_id}",
-                headers={"Prefer": "return=representation"}
-            )
-            result.raise_for_status()
-            # PostgREST returns 200 with empty array if not found, check if actually deleted
-            deleted = result.json()
-            if not deleted:
-                raise HTTPException(status_code=404, detail="Documento no encontrado")
-            return {"message": "Documento eliminado permanentemente", "id": doc_id}
-        else:
-            # SOFT DELETE - marcar como ARCHIVADO
-            result = await client.patch(
-                f"/rest/v1/documentos?id=eq.{doc_id}",
-                json={
-                    "estado": "ARCHIVADO",
-                    "actualizado_en": datetime.utcnow().isoformat()
-                },
-                headers={"Prefer": "return=representation"}
-            )
-            result.raise_for_status()
-            if result.json():
-                return {"message": "Documento archivado", "id": doc_id}
-            raise HTTPException(status_code=404, detail="Documento no encontrado")
-           
+            if doc.get("oficina_origen_sigla") != user_office and doc.get("oficina_destino_sigla") != user_office:
+                raise HTTPException(status_code=403, detail="Sin acceso a este documento")
+
+        # Soft delete
+        payload = {"eliminado_en": datetime.utcnow().isoformat()}
+        result = await client.patch(f"/rest/v1/documentos?id=eq.{doc_id}", json=payload, headers={"Prefer": "return=representation"})
+        result.raise_for_status()
+
+        # Eliminar de Graphify
+        try:
+            if graphify_client:
+                await graphify_client.delete(f"/documentos/{doc_id}", timeout=10)
+        except Exception as e:
+            logger.warning("graphify_delete_failed", error=str(e), doc_id=doc_id)
+
+        return {"message": "Documento eliminado", "id": doc_id}
     except httpx.HTTPStatusError as e:
-        logger.error("delete_documento_failed", error=str(e), response=e.response.text, doc_id=doc_id)
-        # Si el error original es 404, propagar como 404
-        if e.response.status_code == 404:
-            raise HTTPException(status_code=404, detail="Documento no encontrado")
+        logger.error("delete_documento_failed", error=str(e), response=e.response.text)
         raise HTTPException(status_code=500, detail=f"Error eliminando documento: {e.response.text}")
     except Exception as e:
-        # No capturar HTTPException, dejar que se propague
-        if isinstance(e, HTTPException):
-            raise
-        logger.error("delete_documento_failed", error=str(e), doc_id=doc_id)
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ─────────────────────────────────────────────────────────────────
-# ENDPOINTS - VISION/OCR
-# ─────────────────────────────────────────────────────────────────
-
-@app.post("/api/vision/extract", response_model=VisionResponse)
-async def extract_vision(request: VisionRequest):
-    """Extraer datos de imagen/PDF usando Vision API (Ollama o NVIDIA)."""
-    try:
-        # Usar factory para obtener el procesador apropiado
-        processor = get_vision_processor()
-        result = await processor.extract_document_data(request.file_path, request.mime_type)
-        
-        return VisionResponse(
-            success=result["success"],
-            data=result.get("data"),
-            error=result.get("error"),
-            confidence=result.get("confidence", 0.0)
-        )
-    except Exception as e:
-        logger.error("vision_extract_failed", error=str(e))
-        return VisionResponse(success=False, error=str(e))
-
-
-# ─────────────────────────────────────────────────────────────────
-# ENDPOINTS - CONSULTAS GRAPHIFY
-# ─────────────────────────────────────────────────────────────────
-
-@app.get("/api/consultas/trace/{correlativo}")
-async def trace_documento(correlativo: str, graphify: httpx.AsyncClient = Depends(get_graphify_client)):
-    """Trazabilidad completa vía Graphify."""
-    try:
-        resp = await graphify.get(f"/trace/{correlativo}")
-        if resp.status_code == 200:
-            return resp.json()
-        elif resp.status_code == 404:
-            raise HTTPException(status_code=404, detail="Documento no encontrado en grafo")
-        else:
-            raise HTTPException(status_code=500, detail="Error en Graphify")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("trace_failed", error=str(e), correlativo=correlativo)
+        logger.error("delete_documento_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINT - CONSULTAS (PENDIENTES, HUECOS, ETC)
+# ─────────────────────────────────────────────────────────────────
 @app.get("/api/consultas/pendientes")
-async def get_pendientes(dias_limite: int = 5, graphify: httpx.AsyncClient = Depends(get_graphify_client)):
-    """Documentos pendientes de respuesta."""
-    try:
-        resp = await graphify.get("/consultas/pendientes", params={"dias_limite": dias_limite})
-        if resp.status_code == 200:
-            return resp.json()
-        raise HTTPException(status_code=500, detail="Error en Graphify")
-    except Exception as e:
-        logger.error("pendientes_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/consultas/buscar")
-async def buscar_documentos(
-    q: str, 
+async def get_pendientes(
     request: Request,
-    user_info: tuple = Depends(get_user_office_and_role),
-    graphify: httpx.AsyncClient = Depends(get_graphify_client)
-):
-    """Buscar documentos en Graphify. Filtrado automático por oficina."""
-    user_office, user_role = user_info
-    
-    try:
-        params = {"q": q, "limit": 10}
-        if user_role != "ADMIN" and user_office:
-            params["oficina"] = user_office
-        
-        resp = await graphify.get("/buscar", params=params)
-        if resp.status_code == 200:
-            return resp.json()
-        raise HTTPException(status_code=500, detail="Error en Graphify")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("buscar_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/consultas/ultimo-correlativo")
-async def ultimo_correlativo(
     oficina: Optional[str] = None,
-    tipo_documento: Optional[str] = None,
-    graphify: httpx.AsyncClient = Depends(get_graphify_client),
+    tipo: Optional[str] = None,
+    client: httpx.AsyncClient = Depends(get_supabase_client),
 ):
-    """Ultimo correlativo por oficina y tipo (via Graphify)."""
+    """Obtener correlativos pendientes por oficina/tipo."""
     try:
-        params: Dict[str, str] = {}
+        params = {"select": "correlativo", "eliminado_en": "is.null", "order": "correlativo"}
         if oficina:
-            params["oficina"] = oficina
-        if tipo_documento:
-            params["tipo_documento"] = tipo_documento
-        resp = await graphify.get("/consultas/ultimo-correlativo", params=params)
-        if resp.status_code == 200:
-            return resp.json()
-        if resp.status_code == 404:
-            raise HTTPException(status_code=404, detail="No hay documentos en el grafo")
-        raise HTTPException(status_code=500, detail="Error en Graphify")
-    except HTTPException:
-        raise
+            params["oficina_origen_sigla"] = f"eq.{oficina}"
+        if tipo:
+            params["tipo_doc_codigo"] = f"eq.{tipo}"
+
+        result = await client.get("/rest/v1/documentos", params=params)
+        result.raise_for_status()
+        docs = result.json()
+
+        # Extraer números y encontrar huecos
+        correlativos = [d["correlativo"] for d in docs if d.get("correlativo")]
+        # Lógica simplificada - en producción usar la función detectar_huecos
+        return {"pendientes": correlativos, "total": len(correlativos)}
     except Exception as e:
-        logger.error("ultimo_correlativo_failed", error=str(e))
+        logger.error("get_pendientes_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/consultas/por-oficina")
 async def por_oficina(
-    oficina: Optional[str] = None,
+    oficina: str,
     tipo_documento: Optional[str] = None,
     mes: Optional[int] = None,
     anio: Optional[int] = None,
     limit: int = 50,
-    graphify: httpx.AsyncClient = Depends(get_graphify_client),
+    graphify_client: httpx.AsyncClient = Depends(get_graphify_client),
 ):
-    """Documentos por oficina (via Graphify)."""
+    """Consultar documentos por oficina desde Graphify."""
     try:
-        params: Dict[str, str | int] = {"limit": limit}
-        if oficina:
-            params["oficina"] = oficina
+        params = {"oficina": oficina, "limit": limit}
         if tipo_documento:
             params["tipo_documento"] = tipo_documento
         if mes:
             params["mes"] = mes
         if anio:
             params["anio"] = anio
-        resp = await graphify.get("/consultas/por-oficina", params=params)
-        if resp.status_code == 200:
-            return resp.json()
-        raise HTTPException(status_code=500, detail="Error en Graphify")
+
+        result = await graphify_client.get("/consultas/por-oficina", params=params)
+        result.raise_for_status()
+        return result.json()
     except Exception as e:
         logger.error("por_oficina_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─────────────────────────────────────────────────────────────────
-# ENDPOINTS - USUARIOS (auth.users, lectura via psycopg directo)
+# ENDPOINT - CONFIGURACIÓN
 # ─────────────────────────────────────────────────────────────────
-
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
-
-class UsuarioCreate(BaseModel):
-    email: str
-    password: str
-    role: str = "SECRETARIO"
-    nombre: Optional[str] = None
-
-
-class UsuarioUpdate(BaseModel):
-    password: Optional[str] = None
-    role: Optional[str] = None
-    nombre: Optional[str] = None
-
-
-def _caller_role(request: Request) -> Optional[str]:
-    """Rol del usuario autenticado que hace la peticion (None si token invalido)."""
-    from jose import jwt as jose_jwt, JWTError
-    auth = request.headers.get("authorization") or request.headers.get("Authorization")
-    if not auth or not auth.lower().startswith("bearer "):
-        return None
-    token = auth.split(" ", 1)[1].strip()
-    try:
-        # GoTrue firma con aud="" (vacio) y python-jose lo valida estrictamente:
-        # se omite la validacion de audience; la FIRMA sigue verificada.
-        payload = jose_jwt.decode(
-            token, SUPABASE_JWT_SECRET, algorithms=["HS256"],
-            options={"verify_aud": False},
-        )
-    except JWTError:
-        return None
-    sub = payload.get("sub")
-    if not sub or not SUPABASE_DB_PASSWORD:
-        return None
-    # El rol vive en raw_user_meta_data: se lee de la BD para no depender
-    # de tokens viejos con roles desactualizados
-    import psycopg
-    try:
-        conn = psycopg.connect(host="supabase-db", dbname="postgres", user="postgres",
-                               password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5)
-        with conn.cursor() as cur:
-            cur.execute("SELECT raw_user_meta_data->>'role' FROM auth.users WHERE id = %s", (sub,))
-            fila = cur.fetchone()
-        conn.close()
-        return fila[0] if fila else None
-    except Exception:
-        return None
-
-
-@app.get("/api/usuarios")
-async def list_usuarios(request: Request):
-    """Listar cuentas de login (auth.users) - SOLO LECTURA (solo ADMIN).
-
-    Lee email, rol, nombre, estado y ultimo acceso desde el schema auth
-    (no expuesto por PostgREST) via conexion directa a Postgres.
-    No modifica nada.
-    """
-    # Solo ADMIN puede listar usuarios
-    rol = _caller_role(request)
-    if rol != "ADMIN":
-        raise HTTPException(status_code=403, detail="Solo un ADMIN puede listar usuarios")
-
-    import psycopg
-    if not SUPABASE_DB_PASSWORD:
-        raise HTTPException(status_code=500, detail="SUPABASE_DB_PASSWORD no configurada en el backend")
-    try:
-        conn = psycopg.connect(
-            host="supabase-db",
-            dbname="postgres",
-            user="postgres",
-            password=SUPABASE_DB_PASSWORD,
-            port=5432,
-            connect_timeout=5,
-        )
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT u.email,
-                       coalesce(u.raw_user_meta_data->>'role', 'SECRETARIO') as role,
-                       coalesce(u.raw_user_meta_data->>'nombre', '') as nombre,
-                       (u.banned_until IS NULL) as activo,
-                       coalesce(u.email_confirmed_at::text, '') as confirmado,
-                       coalesce(u.last_sign_in_at::text, u.created_at::text) as ultimo_acceso,
-                       u.created_at::text as creado
-                FROM auth.users u
-                ORDER BY u.created_at ASC
-            """)
-            filas = cur.fetchall()
-        conn.close()
-        return [
-            {
-                "email": f[0],
-                "role": f[1],
-                "nombre": f[2],
-                "activo": f[3],
-                "email_confirmado": bool(f[4]),
-                "ultimo_acceso": f[5],
-                "creado": f[6],
-            }
-            for f in filas
-        ]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("list_usuarios_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-        raise
-    except Exception as e:
-        logger.error("list_usuarios_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/usuarios", status_code=201)
-async def create_usuario(nuevo: UsuarioCreate, request: Request):
-    """Registrar un usuario nuevo (solo ADMIN).
-
-    Crea la cuenta via GoTrue Admin API (nunca se insertan password
-    hashes a mano). El rol queda en raw_user_meta_data.
-    """
-    import psycopg
-    # 1. Solo ADMIN puede crear usuarios
-    rol = _caller_role(request)
-    if rol != "ADMIN":
-        raise HTTPException(status_code=403, detail="Solo un ADMIN puede registrar usuarios")
-
-    # 2. Validaciones
-    email = nuevo.email.strip().lower()
-    if "@" not in email or "." not in email.split("@")[-1]:
-        raise HTTPException(status_code=400, detail="Email inválido")
-    if len(nuevo.password) < 8:
-        raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
-    if nuevo.role not in ("ADMIN", "SECRETARIO"):
-        raise HTTPException(status_code=400, detail="Rol inválido (ADMIN o SECRETARIO)")
-
-    # 3. ¿Ya existe?
-    try:
-        conn = psycopg.connect(host="supabase-db", dbname="postgres", user="postgres",
-                               password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5)
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM auth.users WHERE email = %s", (email,))
-            if cur.fetchone():
-                conn.close()
-                raise HTTPException(status_code=409, detail="Ya existe un usuario con ese email")
-        conn.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("create_usuario_check_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # 4. Crear via GoTrue Admin API (hash de password correcto)
-    try:
-        admin_client = httpx.AsyncClient(timeout=15, trust_env=False)
-        resp = await admin_client.post(
-            f"{SUPABASE_URL}/auth/v1/admin/users",
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "email": email,
-                "password": nuevo.password,
-                "email_confirm": True,
-                "user_metadata": {
-                    "role": nuevo.role,
-                    **({"nombre": nuevo.nombre} if nuevo.nombre else {}),
-                },
-            },
-        )
-        await admin_client.aclose()
-        if resp.status_code not in (200, 201):
-            detail = "Error creando usuario en GoTrue"
-            try:
-                detail = resp.json().get("msg") or resp.json().get("message") or detail
-            except Exception:
-                pass
-            logger.error("create_usuario_gotrue_failed", status=resp.status_code, body=resp.text[:300])
-            raise HTTPException(status_code=resp.status_code, detail=detail)
-        creado = resp.json()
-        logger.info("usuario_creado", email=email, rol=nuevo.role)
-        return {
-            "email": creado.get("email", email),
-            "role": nuevo.role,
-            "activo": True,
-            "email_confirmado": True,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("create_usuario_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.put("/api/usuarios/{email}")
-async def update_usuario(email: str, datos: UsuarioUpdate, request: Request):
-    """Actualizar usuario (solo ADMIN). Permite cambiar contraseña, rol o nombre."""
-    import psycopg
-    import httpx
-
-    # 1. Solo ADMIN puede actualizar usuarios
-    rol = _caller_role(request)
-    if rol != "ADMIN":
-        raise HTTPException(status_code=403, detail="Solo un ADMIN puede actualizar usuarios")
-
-    email = email.strip().lower()
-
-    # 2. Verificar que existe
-    try:
-        conn = psycopg.connect(
-            host="supabase-db",
-            dbname="postgres",
-            user="postgres",
-            password=SUPABASE_DB_PASSWORD,
-            port=5432,
-            connect_timeout=5,
-        )
-        with conn.cursor() as cur:
-            cur.execute("SELECT id FROM auth.users WHERE email = %s", (email,))
-            user_row = cur.fetchone()
-            if not user_row:
-                conn.close()
-                raise HTTPException(status_code=404, detail="Usuario no encontrado")
-            user_id = user_row[0]
-        conn.close()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("update_usuario_check_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-    # 3. Actualizar via GoTrue Admin API
-    try:
-        admin_client = httpx.AsyncClient(timeout=15, trust_env=False)
-        update_data = {}
-        if datos.password:
-            if len(datos.password) < 8:
-                raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 8 caracteres")
-            update_data["password"] = datos.password
-        if datos.role:
-            if datos.role not in ("ADMIN", "SECRETARIO"):
-                raise HTTPException(status_code=400, detail="Rol inválido (ADMIN o SECRETARIO)")
-            update_data["user_metadata"] = {"role": datos.role}
-        if datos.nombre is not None:
-            if "user_metadata" not in update_data:
-                update_data["user_metadata"] = {}
-            update_data["user_metadata"]["nombre"] = datos.nombre
-
-        if not update_data:
-            raise HTTPException(status_code=400, detail="No hay datos para actualizar")
-
-        resp = await admin_client.put(
-            f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=update_data,
-        )
-        await admin_client.aclose()
-
-        if resp.status_code not in (200, 201):
-            detail = "Error actualizando usuario en GoTrue"
-            try:
-                detail = resp.json().get("msg") or resp.json().get("message") or detail
-            except Exception:
-                pass
-            logger.error("update_usuario_gotrue_failed", status=resp.status_code, body=resp.text[:300])
-            raise HTTPException(status_code=resp.status_code, detail=detail)
-
-        actualizado = resp.json()
-        logger.info("usuario_actualizado", email=email)
-        return {
-            "email": actualizado.get("email", email),
-            "role": datos.role or actualizado.get("user_metadata", {}).get("role"),
-            "nombre": datos.nombre or actualizado.get("user_metadata", {}).get("nombre"),
-            "message": "Usuario actualizado correctamente",
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("update_usuario_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────────────────────────────
-# ENDPOINTS - BACKUP (ejecutar scripts/backup.sh y listar respaldos)
-# ─────────────────────────────────────────────────────────────────
-
-BACKUP_DIR = os.getenv("BACKUP_DIR", "/backups")
-BACKUP_SCRIPT = os.getenv("BACKUP_SCRIPT", "/scripts/backup.sh")
-RESTORE_SCRIPT = os.getenv("RESTORE_SCRIPT", "/scripts/restore.sh")
-
-
-@app.get("/api/backup/listar")
-async def listar_backups(request: Request):
-    """Listar respaldos existentes con tamaño y fecha (solo ADMIN)."""
-    if _caller_role(request) != "ADMIN":
-        raise HTTPException(status_code=403, detail="Solo un ADMIN puede ver los respaldos")
-    try:
-        archivos = []
-        for nombre in os.listdir(BACKUP_DIR):
-            ruta = os.path.join(BACKUP_DIR, nombre)
-            if os.path.isfile(ruta) and nombre != ".gitkeep":
-                st = os.stat(ruta)
-                archivos.append({
-                    "nombre": nombre,
-                    "tamano_bytes": st.st_size,
-                    "fecha": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z",
-                })
-        archivos.sort(key=lambda a: a["fecha"], reverse=True)
-        return {"backups": archivos, "directorio": BACKUP_DIR}
-    except FileNotFoundError:
-        return {"backups": [], "directorio": BACKUP_DIR}
-    except Exception as e:
-        logger.error("listar_backups_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/backup/ejecutar")
-async def ejecutar_backup(request: Request):
-    """Ejecutar backup AHORA (solo ADMIN). Corre el mismo script del cron.
-
-    El endpoint responde cuando termina (el dump completo tarda segundos),
-    con un resumen de lo generado.
-    """
-    import subprocess
-    import asyncio as _asyncio
-    if _caller_role(request) != "ADMIN":
-        raise HTTPException(status_code=403, detail="Solo un ADMIN puede ejecutar respaldos")
-    if not os.path.exists(BACKUP_SCRIPT):
-        raise HTTPException(status_code=500, detail="Script de backup no encontrado en el backend")
-    try:
-        antes = set(os.listdir(BACKUP_DIR)) if os.path.isdir(BACKUP_DIR) else set()
-        # Ejecutar SIN bloquear el event loop de la API
-        proc = await _asyncio.create_subprocess_exec(
-            "bash", BACKUP_SCRIPT,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.STDOUT,
-        )
-        try:
-            salida, _ = await _asyncio.wait_for(proc.communicate(), timeout=300)
-        except _asyncio.TimeoutError:
-            proc.kill()
-            raise HTTPException(status_code=500, detail="El backup excedió 5 minutos; revisar logs/backup.log")
-        if proc.returncode != 0:
-            logger.error("backup_ejecutar_failed", rc=proc.returncode, salida=salida.decode()[-500:])
-            raise HTTPException(status_code=500, detail="El backup falló; ver logs/backup.log")
-        despues = set(os.listdir(BACKUP_DIR))
-        nuevos = sorted(despues - antes)
-        return {
-            "ok": True,
-            "generados": nuevos,
-            "salida": salida.decode()[-2000:],
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("backup_ejecutar_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/backup/restaurar")
-async def restaurar_backup(request: Request):
-    """Restaurar base de datos desde un backup (solo ADMIN).
-
-    Body JSON: { "archivo": "supabase_20261028_140406.sql.gz", "confirmar": "RESTAURAR" }
-
-    Soporta dos formatos:
-    - .sql.gz (dump plano): usa psql. NO limpia la BD antes (solo inserta).
-    - .dump (custom): usa pg_restore --clean. LIMPIA y recrea la BD completamente (recomendado).
-    """
-    import asyncio as _asyncio
-    if _caller_role(request) != "ADMIN":
-        raise HTTPException(status_code=403, detail="Solo un ADMIN puede restaurar respaldos")
-
-    body = await request.json()
-    archivo = body.get("archivo", "").strip()
-    confirmar = body.get("confirmar", "").strip()
-
-    if not archivo:
-        raise HTTPException(status_code=400, detail="Falta 'archivo' en el body")
-    if confirmar != "RESTAURAR":
-        raise HTTPException(status_code=400, detail="Debe confirmar enviando 'confirmar': 'RESTAURAR'")
-
-    ruta_archivo = os.path.join(BACKUP_DIR, archivo)
-    if not os.path.isfile(ruta_archivo):
-        raise HTTPException(status_code=404, detail=f"Archivo no encontrado: {archivo}")
-
-    es_dump_custom = archivo.endswith(".dump")
-    es_sql_gz = archivo.endswith(".sql.gz")
-
-    if not (es_dump_custom or es_sql_gz):
-        raise HTTPException(status_code=400, detail="Formato no soportado. Use .sql.gz o .dump")
-
-    # Servicios a detener/iniciar
-    servicios = ["backend", "telegram-bot", "graphify", "migrator"]
-
-    # Detectar si estamos en host (docker disponible) o contenedor
-    import shutil
-    docker_disponible = shutil.which("docker") is not None
-
-    try:
-        # 1. Detener servicios que usan la BD (evita conexiones activas durante restore)
-        #    Solo si docker está disponible (entorno host)
-        if docker_disponible:
-            for s in servicios:
-                proc = await _asyncio.create_subprocess_exec(
-                    "docker", "compose", "stop", s,
-                    stdout=_asyncio.subprocess.DEVNULL,
-                    stderr=_asyncio.subprocess.DEVNULL,
-                    cwd="/home/openclaw/office-secretary-document-agent"
-                )
-                await proc.wait()
-
-        # 2. Ejecutar restauración según formato
-        if es_dump_custom:
-            # pg_restore --clean falla por SET transaction_timeout en el dump (PostgreSQL 17+)
-            # Solución: extraer SQL del dump custom, filtrar SET problemáticos, y ejecutar con psql
-            # Nota: stderr de pg_restore (warnings) no debe ir a psql, solo stdout (SQL)
-            if docker_disponible:
-                # Host: pg_restore a SQL limpio (stdout) -> psql en contenedor DB
-                # stderr va a /dev/null para no contaminar el SQL
-                restore_cmd = (
-                    f"docker exec osda-supabase-db pg_restore -U postgres -d postgres "
-                    f"--clean --if-exists --no-owner --no-privileges --no-tablespaces "
-                    f"--no-security-labels --no-comments {ruta_archivo} 2>/dev/null | "
-                    f"grep -v '^SET transaction_timeout' | "
-                    f"docker exec -i osda-supabase-db psql -U postgres -d postgres"
-                )
-                proc = await _asyncio.create_subprocess_shell(
-                    restore_cmd,
-                    stdout=_asyncio.subprocess.PIPE,
-                    stderr=_asyncio.subprocess.STDOUT,
-                    cwd="/home/openclaw/office-secretary-document-agent"
-                )
-            else:
-                # Contenedor: pg_restore a SQL limpio (stdout) -> psql directo
-                restore_cmd = (
-                    f"PGPASSWORD=\"$SUPABASE_DB_PASSWORD\" pg_restore -h supabase-db -U postgres -d postgres "
-                    f"--clean --if-exists --no-owner --no-privileges --no-tablespaces "
-                    f"--no-security-labels --no-comments {ruta_archivo} 2>/dev/null | "
-                    f"grep -v '^SET transaction_timeout' | "
-                    f"PGPASSWORD=\"$SUPABASE_DB_PASSWORD\" psql -h supabase-db -U postgres -d postgres"
-                )
-                proc = await _asyncio.create_subprocess_shell(
-                    restore_cmd,
-                    stdout=_asyncio.subprocess.PIPE,
-                    stderr=_asyncio.subprocess.STDOUT,
-                )
-        else:
-            # .sql.gz: psql (no limpia, solo inserta - puede fallar por duplicados)
-            if docker_disponible:
-                restore_cmd = f"gunzip -c {ruta_archivo} | docker exec -i osda-supabase-db psql -U postgres -d postgres"
-                proc = await _asyncio.create_subprocess_shell(
-                    restore_cmd,
-                    stdout=_asyncio.subprocess.PIPE,
-                    stderr=_asyncio.subprocess.STDOUT,
-                    cwd="/home/openclaw/office-secretary-document-agent"
-                )
-            else:
-                restore_cmd = f"gunzip -c {ruta_archivo} | PGPASSWORD=\"$SUPABASE_DB_PASSWORD\" psql -h supabase-db -U postgres -d postgres"
-                proc = await _asyncio.create_subprocess_shell(
-                    restore_cmd,
-                    stdout=_asyncio.subprocess.PIPE,
-                    stderr=_asyncio.subprocess.STDOUT,
-                )
-        try:
-            salida, _ = await _asyncio.wait_for(proc.communicate(), timeout=300)
-        except _asyncio.TimeoutError:
-            proc.kill()
-            # Intentar reiniciar servicios aunque falle
-            for s in servicios:
-                await _asyncio.create_subprocess_exec("docker", "compose", "start", s, cwd="/home/openclaw/office-secretary-document-agent")
-            raise HTTPException(status_code=500, detail="La restauración excedió 5 minutos; revisar logs")
-
-        if proc.returncode != 0:
-            logger.error("backup_restaurar_failed", rc=proc.returncode, salida=salida.decode()[-1000:])
-            # Intentar reiniciar servicios solo si docker disponible
-            if docker_disponible:
-                for s in servicios:
-                    await _asyncio.create_subprocess_exec("docker", "compose", "start", s, cwd="/home/openclaw/office-secretary-document-agent")
-            raise HTTPException(status_code=500, detail=f"La restauración falló (código {proc.returncode}); ver salida")
-
-        # 3. Reiniciar servicios (solo si docker disponible)
-        if docker_disponible:
-            for s in servicios:
-                proc = await _asyncio.create_subprocess_exec(
-                    "docker", "compose", "start", s,
-                    stdout=_asyncio.subprocess.DEVNULL,
-                    stderr=_asyncio.subprocess.DEVNULL,
-                    cwd="/home/openclaw/office-secretary-document-agent"
-                )
-                await proc.wait()
-
-        # 4. Esperar un poco y verificar
-        await _asyncio.sleep(5)
-
-        return {
-            "ok": True,
-            "archivo": archivo,
-            "mensaje": "Base de datos restaurada y servicios reiniciados" if docker_disponible else "Base de datos restaurada",
-            "salida": salida.decode()[-2000:],
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("backup_restaurar_failed", error=str(e))
-        # Intentar reiniciar servicios en caso de error (solo si docker disponible)
-        if docker_disponible:
-            for s in servicios:
-                await _asyncio.create_subprocess_exec("docker", "compose", "start", s, cwd="/home/openclaw/office-secretary-document-agent")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────────────────────────────
-# ENDPOINTS - OFICINAS
-# ─────────────────────────────────────────────────────────────────
-
-@app.get("/api/oficinas", response_model=list[OficinaResponse])
-async def list_oficinas(activas: Optional[bool] = None, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Listar oficinas."""
-    try:
-        params = {"select": "*", "order": "sigla"}
-        if activas is not None:
-            params["activa"] = f"eq.{str(activas).lower()}"
-        result = await client.get("/rest/v1/oficinas", params=params)
-        result.raise_for_status()
-        return result.json()
-    except httpx.HTTPStatusError as e:
-        logger.error("list_oficinas_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.error("list_oficinas_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/oficinas", response_model=OficinaResponse, status_code=201)
-async def create_oficina(oficina: OficinaCreate, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Crear oficina."""
-    try:
-        # Verificar si ya existe
-        check_result = await client.get(f"/rest/v1/oficinas?sigla=eq.{oficina.sigla}&select=sigla")
-        if check_result.status_code == 200 and check_result.json():
-            raise HTTPException(status_code=409, detail=f"La oficina con sigla '{oficina.sigla}' ya existe")
-        
-        data = oficina.model_dump()
-        # Agregar timestamps requeridos
-        from datetime import datetime
-        now = datetime.utcnow().isoformat()
-        data["creada_en"] = now
-        data["actualizada_en"] = now
-        
-        result = await client.post(
-            "/rest/v1/oficinas",
-            json=data,
-            headers={"Prefer": "return=representation"}
-        )
-        result.raise_for_status()
-        return OficinaResponse(**result.json()[0])
-    except httpx.HTTPStatusError as e:
-        logger.error("create_oficina_failed", error=str(e), response=e.response.text)
-        raise HTTPException(status_code=500, detail=f"Error creando oficina: {e.response.text}")
-    except Exception as e:
-        logger.error("create_oficina_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.put("/api/oficinas/{sigla}", response_model=OficinaResponse)
-async def update_oficina(sigla: str, oficina: OficinaCreate, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Actualizar oficina."""
-    try:
-        data = oficina.model_dump()
-        # Agregar timestamp de actualización
-        from datetime import datetime
-        data["actualizada_en"] = datetime.utcnow().isoformat()
-        
-        result = await client.patch(
-            f"/rest/v1/oficinas?sigla=eq.{sigla}",
-            json=data,
-            headers={"Prefer": "return=representation"}
-        )
-        result.raise_for_status()
-        data = result.json()
-        if data:
-            return OficinaResponse(**data[0])
-        raise HTTPException(status_code=404, detail="Oficina no encontrada")
-    except httpx.HTTPStatusError as e:
-        logger.error("update_oficina_failed", error=str(e), response=e.response.text)
-        raise HTTPException(status_code=500, detail=f"Error actualizando oficina: {e.response.text}")
-    except Exception as e:
-        logger.error("update_oficina_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/api/oficinas/{sigla}")
-async def delete_oficina(sigla: str, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Eliminar oficina (soft delete - marcar inactiva)."""
-    try:
-        result = await client.patch(
-            f"/rest/v1/oficinas?sigla=eq.{sigla}",
-            json={"activa": False},
-            headers={"Prefer": "return=representation"}
-        )
-        result.raise_for_status()
-        if result.json():
-            return {"message": "Oficina desactivada", "sigla": sigla}
-        raise HTTPException(status_code=404, detail="Oficina no encontrada")
-    except httpx.HTTPStatusError as e:
-        logger.error("delete_oficina_failed", error=str(e), response=e.response.text)
-        raise HTTPException(status_code=500, detail=f"Error eliminando oficina: {e.response.text}")
-    except Exception as e:
-        logger.error("delete_oficina_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────────────────────────────
-# ENDPOINTS - TIPOS DOCUMENTO
-# ─────────────────────────────────────────────────────────────────
-
-@app.get("/api/tipos-documento", response_model=list[TipoDocumentoResponse])
-async def list_tipos_documento(client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Listar tipos de documento."""
-    try:
-        result = await client.get("/rest/v1/tipos_documento", params={"select": "*", "order": "codigo"})
-        result.raise_for_status()
-        return result.json()
-    except httpx.HTTPStatusError as e:
-        logger.error("list_tipos_documento_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.error("list_tipos_documento_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/tipos-documento", response_model=TipoDocumentoResponse, status_code=201)
-async def create_tipo_documento(tipo: TipoDocumentoCreate, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Crear tipo de documento."""
-    try:
-        # Verificar si ya existe
-        check_result = await client.get(f"/rest/v1/tipos_documento?codigo=eq.{tipo.codigo}&select=codigo")
-        if check_result.status_code == 200 and check_result.json():
-            raise HTTPException(status_code=409, detail=f"El tipo de documento con código '{tipo.codigo}' ya existe")
-        
-        data = tipo.model_dump()
-        result = await client.post(
-            "/rest/v1/tipos_documento",
-            json=data,
-            headers={"Prefer": "return=representation"}
-        )
-        result.raise_for_status()
-        return TipoDocumentoResponse(**result.json()[0])
-    except httpx.HTTPStatusError as e:
-        logger.error("create_tipo_documento_failed", error=str(e), response=e.response.text)
-        raise HTTPException(status_code=500, detail=f"Error creando tipo documento: {e.response.text}")
-    except Exception as e:
-        logger.error("create_tipo_documento_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.put("/api/tipos-documento/{codigo}", response_model=TipoDocumentoResponse)
-async def update_tipo_documento(codigo: str, tipo: TipoDocumentoCreate, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Actualizar tipo de documento."""
-    try:
-        data = tipo.model_dump()
-        result = await client.patch(
-            f"/rest/v1/tipos_documento?codigo=eq.{codigo}",
-            json=data,
-            headers={"Prefer": "return=representation"}
-        )
-        result.raise_for_status()
-        data = result.json()
-        if data:
-            return TipoDocumentoResponse(**data[0])
-        raise HTTPException(status_code=404, detail="Tipo de documento no encontrado")
-    except httpx.HTTPStatusError as e:
-        logger.error("update_tipo_documento_failed", error=str(e), response=e.response.text)
-        raise HTTPException(status_code=500, detail=f"Error actualizando tipo documento: {e.response.text}")
-    except Exception as e:
-        logger.error("update_tipo_documento_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/api/tipos-documento/{codigo}")
-async def delete_tipo_documento(codigo: str, client: httpx.AsyncClient = Depends(get_supabase_client)):
-    """Eliminar tipo de documento."""
-    try:
-        result = await client.delete(
-            f"/rest/v1/tipos_documento?codigo=eq.{codigo}",
-            headers={"Prefer": "return=representation"}
-        )
-        result.raise_for_status()
-        if result.json():
-            return {"message": "Tipo de documento eliminado", "codigo": codigo}
-        raise HTTPException(status_code=404, detail="Tipo de documento no encontrado")
-    except httpx.HTTPStatusError as e:
-        logger.error("delete_tipo_documento_failed", error=str(e), response=e.response.text)
-        raise HTTPException(status_code=500, detail=f"Error eliminando tipo documento: {e.response.text}")
-    except Exception as e:
-        logger.error("delete_tipo_documento_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────────────────────────────
-# ENDPOINTS - CONFIGURACIÓN GENERAL
-# ─────────────────────────────────────────────────────────────────
-
-class ConfiguracionGeneral(BaseModel):
-    sitio_nombre: str
-    sitio_url: str
-    zona_horaria: str
-    idioma: str
-    tamano_maximo_subida: int
-    tipos_permitidos: str
-    retencion_dias: int
-    bucket_storage: str
-
-
 @app.get("/api/configuracion")
-async def get_configuracion(request: Request):
+async def get_configuracion(
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+):
     """Obtener configuración general del sistema (solo ADMIN)."""
-    rol = _caller_role(request)
+    user_office, rol = user_info
     if rol != "ADMIN":
         raise HTTPException(status_code=403, detail="Solo un ADMIN puede ver la configuración")
 
     try:
-        conn = psycopg.connect(
-            host="supabase-db",
-            dbname="postgres",
-            user="postgres",
-            password=SUPABASE_DB_PASSWORD,
-            port=5432,
-            connect_timeout=5,
-        )
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM configuracion WHERE id = 1")
-            fila = cur.fetchone()
-        conn.close()
+        with psycopg.connect(
+            host="supabase-db", dbname="postgres", user="postgres",
+            password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM configuracion WHERE id = 1")
+                fila = cur.fetchone()
 
         if not fila:
-            # Retornar valores por defecto si no existe
             return {
                 "id": 1,
                 "sitio_nombre": "Secretaría",
@@ -1836,53 +999,627 @@ async def get_configuracion(request: Request):
 
 
 @app.put("/api/configuracion")
-async def update_configuracion(datos: ConfiguracionGeneral, request: Request):
+async def update_configuracion(
+    datos: ConfiguracionGeneral,
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+):
     """Actualizar configuración general (solo ADMIN)."""
-    rol = _caller_role(request)
+    user_office, rol = user_info
     if rol != "ADMIN":
         raise HTTPException(status_code=403, detail="Solo un ADMIN puede actualizar la configuración")
 
     try:
-        conn = psycopg.connect(
-            host="supabase-db",
-            dbname="postgres",
-            user="postgres",
-            password=SUPABASE_DB_PASSWORD,
-            port=5432,
-            connect_timeout=5,
-        )
-        with conn.cursor() as cur:
-            # Upsert: insertar si no existe, actualizar si existe
-            cur.execute("""
-                INSERT INTO configuracion (id, sitio_nombre, sitio_url, zona_horaria, idioma, 
-                    tamano_maximo_subida, tipos_permitidos, retencion_dias, bucket_storage)
-                VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (id) DO UPDATE SET
-                    sitio_nombre = EXCLUDED.sitio_nombre,
-                    sitio_url = EXCLUDED.sitio_url,
-                    zona_horaria = EXCLUDED.zona_horaria,
-                    idioma = EXCLUDED.idioma,
-                    tamano_maximo_subida = EXCLUDED.tamano_maximo_subida,
-                    tipos_permitidos = EXCLUDED.tipos_permitidos,
-                    retencion_dias = EXCLUDED.retencion_dias,
-                    bucket_storage = EXCLUDED.bucket_storage,
-                    actualizado_en = NOW()
-                RETURNING id
-            """, (
-                datos.sitio_nombre, datos.sitio_url, datos.zona_horaria, datos.idioma,
-                datos.tamano_maximo_subida, datos.tipos_permitidos, 
-                datos.retencion_dias, datos.bucket_storage
-            ))
-            conn.commit()
-            fila = cur.fetchone()
-        conn.close()
-
-        return {"message": "Configuración actualizada correctamente", "id": fila[0]}
+        with psycopg.connect(
+            host="supabase-db", dbname="postgres", user="postgres",
+            password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO configuracion (id, sitio_nombre, sitio_url, zona_horaria, idioma,
+                        tamano_maximo_subida, tipos_permitidos, retencion_dias, bucket_storage)
+                    VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        sitio_nombre = EXCLUDED.sitio_nombre,
+                        sitio_url = EXCLUDED.sitio_url,
+                        zona_horaria = EXCLUDED.zona_horaria,
+                        idioma = EXCLUDED.idioma,
+                        tamano_maximo_subida = EXCLUDED.tamano_maximo_subida,
+                        tipos_permitidos = EXCLUDED.tipos_permitidos,
+                        retencion_dias = EXCLUDED.retencion_dias,
+                        bucket_storage = EXCLUDED.bucket_storage,
+                """, (
+                    datos.sitio_nombre, datos.sitio_url, datos.zona_horaria, datos.idioma,
+                    datos.tamano_maximo_subida, datos.tipos_permitidos,
+                    datos.retencion_dias, datos.bucket_storage,
+                ))
+                conn.commit()
+        return {"message": "Configuración actualizada correctamente", "id": 1}
     except HTTPException:
         raise
     except Exception as e:
         logger.error("update_configuracion_failed", error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINT - BACKUP
+# ─────────────────────────────────────────────────────────────────
+@app.get("/api/backup/listar")
+async def listar_backups(
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+):
+    """Listar respaldos existentes con tamaño y fecha (solo ADMIN)."""
+    user_office, rol = user_info
+    if rol != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede ver los respaldos")
+
+    try:
+        archivos = []
+        for nombre in os.listdir(BACKUP_DIR):
+            ruta = os.path.join(BACKUP_DIR, nombre)
+            if os.path.isfile(ruta) and nombre != ".gitkeep":
+                st = os.stat(ruta)
+                archivos.append({
+                    "nombre": nombre,
+                    "tamano_bytes": st.st_size,
+                    "fecha": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z",
+                })
+        archivos.sort(key=lambda a: a["fecha"], reverse=True)
+        return {"backups": archivos, "directorio": BACKUP_DIR}
+    except FileNotFoundError:
+        return {"backups": [], "directorio": BACKUP_DIR}
+    except Exception as e:
+        logger.error("listar_backups_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/backup/ejecutar")
+async def ejecutar_backup(
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+):
+    """Ejecutar backup AHORA (solo ADMIN)."""
+    user_office, rol = user_info
+    if rol != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede ejecutar respaldos")
+
+    if not os.path.exists(BACKUP_SCRIPT):
+        raise HTTPException(status_code=500, detail="Script de backup no encontrado en el backend")
+
+    try:
+        antes = set(os.listdir(BACKUP_DIR)) if os.path.isdir(BACKUP_DIR) else set()
+        proc = await asyncio.create_subprocess_exec(
+            "bash", BACKUP_SCRIPT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            salida, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise HTTPException(status_code=500, detail="El backup excedió 5 minutos; revisar logs/backup.log")
+
+        if proc.returncode != 0:
+            logger.error("backup_ejecutar_failed", rc=proc.returncode, salida=salida.decode()[-500:])
+            raise HTTPException(status_code=500, detail="El backup falló; ver logs/backup.log")
+
+        despues = set(os.listdir(BACKUP_DIR))
+        nuevos = sorted(despues - antes)
+        return {
+            "ok": True,
+            "generados": nuevos,
+            "salida": salida.decode()[-2000:],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("backup_ejecutar_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/backup/restaurar")
+async def restaurar_backup(
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+):
+    """Restaurar base de datos desde un backup (solo ADMIN)."""
+    user_office, rol = user_info
+    if rol != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo un ADMIN puede restaurar respaldos")
+
+    import asyncio as _asyncio
+    body = await request.json()
+    archivo = body.get("archivo", "").strip()
+    confirmar = body.get("confirmar", "").strip()
+
+    if not archivo:
+        raise HTTPException(status_code=400, detail="Falta 'archivo' en el body")
+    if confirmar != "RESTAURAR":
+        raise HTTPException(status_code=400, detail="Debe confirmar enviando 'confirmar': 'RESTAURAR'")
+
+    ruta_archivo = os.path.join(BACKUP_DIR, archivo)
+    if not os.path.isfile(ruta_archivo):
+        raise HTTPException(status_code=404, detail=f"Archivo no encontrado: {archivo}")
+
+    es_dump_custom = archivo.endswith(".dump")
+    es_sql_gz = archivo.endswith(".sql.gz")
+
+    if not (es_dump_custom or es_sql_gz):
+        raise HTTPException(status_code=400, detail="Formato no soportado. Use .sql.gz o .dump")
+
+    servicios = ["backend", "telegram-bot", "graphify", "migrator"]
+
+    import shutil
+    docker_disponible = shutil.which("docker") is not None
+
+    try:
+        if docker_disponible:
+            for s in servicios:
+                proc = await _asyncio.create_subprocess_exec(
+                    "docker", "compose", "stop", s,
+                    stdout=_asyncio.subprocess.DEVNULL,
+                    stderr=_asyncio.subprocess.DEVNULL,
+                    cwd="/home/openclaw/office-secretary-document-agent"
+                )
+                await proc.wait()
+
+        if es_dump_custom:
+            proc = await _asyncio.create_subprocess_exec(
+                "pg_restore", "--clean", "--if-exists", "--no-owner", "--no-privileges",
+                "--dbname=postgresql://postgres:postgres@supabase-db:5432/postgres",
+                ruta_archivo,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+        else:
+            proc = await _asyncio.create_subprocess_exec(
+                "gunzip", "-c", ruta_archivo,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            gunzip_out, _ = await proc.communicate()
+            proc = await _asyncio.create_subprocess_exec(
+                "psql", "-h", "supabase-db", "-U", "postgres", "-d", "postgres",
+                stdin=_asyncio.subprocess.PIPE,
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            await proc.communicate(input=gunzip_out)
+
+        if docker_disponible:
+            for s in servicios:
+                proc = await _asyncio.create_subprocess_exec(
+                    "docker", "compose", "start", s,
+                    stdout=_asyncio.subprocess.DEVNULL,
+                    stderr=_asyncio.subprocess.DEVNULL,
+                    cwd="/home/openclaw/office-secretary-document-agent"
+                )
+                await proc.wait()
+
+        return {"ok": True, "mensaje": f"Restaurado desde {archivo}"}
+    except Exception as e:
+        logger.error("backup_restaurar_failed", error=str(e))
+        if docker_disponible:
+            for s in servicios:
+                try:
+                    proc = await _asyncio.create_subprocess_exec(
+                        "docker", "compose", "start", s,
+                        stdout=_asyncio.subprocess.DEVNULL,
+                        stderr=_asyncio.subprocess.DEVNULL,
+                        cwd="/home/openclaw/office-secretary-document-agent"
+                    )
+                    await proc.wait()
+                except Exception:
+                    pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINT - PERSONAS / USUARIOS
+# ─────────────────────────────────────────────────────────────────
+@app.get("/api/oficinas")
+async def listar_oficinas(
+    request: Request,
+    active_only: bool = True,
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Listar oficinas (público para selects)."""
+    params = {
+        "order": "sigla.asc",
+    }
+    if active_only:
+        params["activa"] = "eq.true"
+
+    try:
+        result = await client.get("/rest/v1/oficinas", params=params)
+        result.raise_for_status()
+        return result.json()
+    except Exception as e:
+        logger.error("listar_oficinas_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/tipos-documento")
+async def listar_tipos_documento(
+    request: Request,
+    active_only: bool = True,
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Listar tipos de documento (público para selects)."""
+    params = {
+        "order": "codigo.asc",
+    }
+    if active_only:
+        params["activo"] = "eq.true"
+
+    try:
+        result = await client.get("/rest/v1/tipos_documento", params=params)
+        result.raise_for_status()
+        return result.json()
+    except Exception as e:
+        logger.error("listar_tipos_documento_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/personas")
+async def listar_personas(
+    request: Request,
+    limit: int = 50,
+    offset: int = 0,
+    active_only: bool = True,
+    rol: str = Depends(_verify_admin_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Listar personas (solo ADMIN)."""
+    params = {
+        "limit": limit,
+        "offset": offset,
+        "order": "nombre.asc",
+    }
+    if active_only:
+        params["activa"] = "eq.true"
+
+    try:
+        result = await client.get("/rest/v1/personas", params=params)
+        result.raise_for_status()
+        personas = result.json()
+
+        # Enriquecer con el rol real, que vive en auth.users (user_metadata),
+        # no en la tabla personas. Mapea por id (personas.id == auth.users.id).
+        if personas:
+            roles = {}
+            try:
+                with psycopg.connect(
+                    host="supabase-db", dbname="postgres", user="postgres",
+                    password=SUPABASE_DB_PASSWORD, port=5432, connect_timeout=5,
+                ) as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT id, raw_user_meta_data->>'role' FROM auth.users WHERE id = ANY(%s)",
+                            ([p["id"] for p in personas],),
+                        )
+                        for uid, role in cursor.fetchall():
+                            roles[str(uid)] = role
+            except psycopg.Error as error:
+                logger.error("listar_personas_roles_failed", error=str(error))
+
+            for p in personas:
+                p["role"] = roles.get(str(p.get("id"))) or "SECRETARIO"
+
+        return personas
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("listar_personas_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/personas", status_code=201)
+async def crear_persona(
+    request: Request,
+    rol: str = Depends(_verify_admin_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Crear persona (solo ADMIN)."""
+    body = await request.json()
+    try:
+        result = await client.post("/rest/v1/personas", json=body, headers={"Prefer": "return=representation"})
+        result.raise_for_status()
+        return result.json()[0]
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=500, detail=f"Error creando persona: {e.response.text}")
+
+
+@app.patch("/api/personas/{persona_id}")
+async def actualizar_persona(
+    persona_id: str,
+    request: Request,
+    rol: str = Depends(_verify_admin_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Actualizar persona (solo ADMIN)."""
+    body = await request.json()
+    try:
+        result = await client.patch(f"/rest/v1/personas?id=eq.{persona_id}", json=body, headers={"Prefer": "return=representation"})
+        result.raise_for_status()
+        if not result.json():
+            raise HTTPException(status_code=404, detail="Persona no encontrada")
+        return result.json()[0]
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=500, detail=f"Error actualizando persona: {e.response.text}")
+
+
+@app.delete("/api/personas/{persona_id}")
+async def eliminar_persona(
+    persona_id: str,
+    request: Request,
+    rol: str = Depends(_verify_admin_role),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Eliminar persona (solo ADMIN)."""
+    try:
+        result = await client.delete(f"/rest/v1/personas?id=eq.{persona_id}", headers={"Prefer": "return=representation"})
+        if result.status_code == 200:
+            return {"message": "Persona eliminada", "id": persona_id}
+        raise HTTPException(status_code=404, detail="Persona no encontrada")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=500, detail=f"Error eliminando persona: {e.response.text}")
+
+
+
+
+@app.get("/api/personas/username/{username}/email")
+async def get_email_by_username(
+    username: str,
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Endpoint publico para obtener email dado un username (para login)."""
+    try:
+        result = await client.get(
+            "/rest/v1/personas",
+            params={
+                "username": f"eq.{username}",
+                "select": "email",
+                "limit": 1,
+            }
+        )
+        result.raise_for_status()
+        data = result.json()
+        if not data:
+            raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        return {"email": data[0]["email"]}
+    except httpx.HTTPStatusError as e:
+        logger.error("get_email_by_username_failed", error=str(e), response=e.response.text)
+        raise HTTPException(status_code=500, detail="Error consultando usuario")
+    except Exception as e:
+        logger.error("get_email_by_username_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/personas/me/oficina")
+async def get_persona_oficina(
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Obtener oficina del usuario autenticado."""
+    try:
+        result = await client.get(
+            "/rest/v1/personas",
+            params={
+                "id": f"eq.{current_user.id}",
+                "select": "oficina_sigla,nombre",
+                "limit": 1,
+            }
+        )
+        result.raise_for_status()
+        data = result.json()
+        if not data:
+            raise HTTPException(status_code=404, detail="Persona no encontrada")
+        return {"oficina_sigla": data[0].get("oficina_sigla"), "nombre": data[0].get("nombre")}
+    except httpx.HTTPStatusError as e:
+        logger.error("get_persona_oficina_failed", error=str(e), response=e.response.text)
+        raise HTTPException(status_code=500, detail="Error consultando oficina")
+    except Exception as e:
+        logger.error("get_persona_oficina_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINT - USUARIOS UNIFICADO
+# ─────────────────────────────────────────────────────────────────
+@app.post("/api/usuarios", status_code=201)
+async def crear_usuario(
+    data: UsuarioCreate,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Crear usuario completo: Auth + Persona en una sola llamada."""
+    if current_user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo ADMIN puede crear usuarios")
+
+    try:
+        # 1. Crear en Auth (GoTrue via Kong admin API)
+        async with httpx.AsyncClient(
+            base_url=SUPABASE_URL,
+            headers={"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
+            timeout=30.0,
+        ) as admin_client:
+            auth_payload = {
+                "email": data.email,
+                "password": data.password,
+                "email_confirm": True,
+                "user_metadata": {
+                    "nombre": data.nombre,
+                    "role": data.role,
+                    "username": data.username or data.email.split("@")[0],
+                }
+            }
+            auth_resp = await admin_client.post("/auth/v1/admin/users", json=auth_payload)
+            if auth_resp.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"Error en Auth: {auth_resp.text}")
+            auth_user = auth_resp.json()
+            user_id = auth_user["id"]
+
+        # 2. Crear en personas
+        persona_payload = {
+            "id": user_id,
+            "nombre": data.nombre,
+            "cargo": data.cargo,
+            "oficina_sigla": data.oficina_sigla,
+            "telegram_user_id": data.telegram_user_id,
+            "username": data.username,
+            "email": data.email,
+            "activa": data.activa,
+        }
+        async with httpx.AsyncClient(
+            base_url=SUPABASE_URL,
+            headers={"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
+            timeout=30.0,
+        ) as admin_client:
+            persona_resp = await admin_client.post("/rest/v1/personas", json=persona_payload, headers={"Prefer": "return=representation"})
+            persona_resp.raise_for_status()
+
+        return {"message": "Usuario creado", "id": user_id}
+    except Exception as e:
+        logger.error("crear_usuario_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/usuarios/{usuario_id}")
+async def actualizar_usuario(
+    usuario_id: str,
+    data: UsuarioUpdate,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Actualizar usuario (Auth y/o Persona)."""
+    if current_user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo ADMIN puede actualizar usuarios")
+
+    try:
+        # Actualizar Auth si se proporciona password/email/role
+        if data.password or data.email or data.role:
+            async with httpx.AsyncClient(
+                base_url=SUPABASE_URL,
+                headers={"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
+                timeout=30.0,
+            ) as admin_client:
+                auth_payload = {}
+                if data.password:
+                    auth_payload["password"] = data.password
+                if data.email:
+                    auth_payload["email"] = data.email
+                if data.role:
+                    auth_payload["user_metadata"] = {"role": data.role}
+                auth_resp = await admin_client.put(f"/auth/v1/admin/users/{usuario_id}", json=auth_payload)
+                if auth_resp.status_code not in (200, 204):
+                    logger.warning("auth_update_warning", status=auth_resp.status_code, resp=auth_resp.text)
+
+        # Actualizar persona
+        # Nota: "role" NO existe en la tabla personas; el rol vive en user_metadata de Auth.
+        persona_payload = {}
+        if data.nombre is not None:
+            persona_payload["nombre"] = data.nombre
+        if data.cargo is not None:
+            persona_payload["cargo"] = data.cargo
+        if data.oficina_sigla is not None:
+            persona_payload["oficina_sigla"] = data.oficina_sigla
+        if data.telegram_user_id is not None:
+            persona_payload["telegram_user_id"] = data.telegram_user_id
+        if data.username is not None:
+            persona_payload["username"] = data.username
+        if data.email is not None:
+            persona_payload["email"] = data.email
+        if data.activa is not None:
+            persona_payload["activa"] = data.activa
+
+        if persona_payload:
+            async with httpx.AsyncClient(
+                base_url=SUPABASE_URL,
+                headers={"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
+                timeout=30.0,
+            ) as admin_client:
+                persona_resp = await admin_client.patch(
+                    f"/rest/v1/personas?id=eq.{usuario_id}",
+                    json=persona_payload,
+                    headers={"Prefer": "return=representation"}
+                )
+                persona_resp.raise_for_status()
+                if not persona_resp.json():
+                    raise HTTPException(status_code=404, detail="Usuario no encontrado en personas")
+
+        return {"message": "Usuario actualizado", "id": usuario_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("actualizar_usuario_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/usuarios/{usuario_id}")
+async def eliminar_usuario(
+    usuario_id: str,
+    request: Request,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Eliminar usuario completo: Auth + Persona (solo ADMIN)."""
+    if current_user.role != "ADMIN":
+        raise HTTPException(status_code=403, detail="Solo ADMIN puede eliminar usuarios")
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=SUPABASE_URL,
+            headers={"apikey": SUPABASE_SERVICE_ROLE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
+            timeout=30.0,
+        ) as admin_client:
+            await admin_client.delete(f"/auth/v1/admin/users/{usuario_id}")
+            await admin_client.delete(f"/rest/v1/personas?id=eq.{usuario_id}")
+
+        return {"message": "Usuario eliminado", "id": usuario_id}
+    except Exception as e:
+        logger.error("eliminar_usuario_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINT - GRAPHIFY TRACE
+# ─────────────────────────────────────────────────────────────────
+@app.get("/api/graphify/trace/{correlativo}")
+async def graphify_trace(
+    correlativo: str,
+    request: Request,
+    user_info: tuple = Depends(get_user_office_and_role),
+    client: httpx.AsyncClient = Depends(get_graphify_client),
+):
+    """Obtener trazabilidad de un documento desde Graphify."""
+    try:
+        result = await client.get(f"/trace/{correlativo}")
+        result.raise_for_status()
+        return result.json()
+    except Exception as e:
+        logger.error("graphify_trace_failed", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────
+# ENDPOINT - WEBHOOK TELEGRAM
+# ─────────────────────────────────────────────────────────────────
+@app.post("/webhook/telegram")
+async def telegram_webhook(
+    request: Request,
+    client: httpx.AsyncClient = Depends(get_supabase_client),
+):
+    """Webhook para Telegram (opcional, si no se usa polling)."""
+    # Por ahora solo logging - el bot usa polling
+    body = await request.json()
+    logger.info("telegram_webhook_received", update_id=body.get("update_id"))
+    return {"ok": True}
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ const navigation = [
   { name: 'Documentos', href: '/documentos', icon: FileText },
   { name: 'Oficinas', href: '/oficinas', icon: Building2 },
   { name: 'Tipos de Documento', href: '/tipos-documento', icon: FileStack },
-  { name: 'Personas', href: '/personas', icon: Users },
+  { name: 'Usuarios', href: '/usuarios', icon: Users, adminOnly: true },
   { name: 'Consultas', href: '/consultas', icon: Search },
   { name: 'Configuración', href: '/configuracion', icon: Settings, adminOnly: true },
 ]

@@ -30,14 +30,16 @@ class Settings(BaseSettings):
     GRAPHIFY_INDEX_NAME: str = "osda_docs"
     
     # Ollama
-    OLLAMA_URL: str = "http://172.18.0.11:11434"
+    OLLAMA_URL: str = "http://ollama:11434"
     VISION_MODEL: str = "llava:latest"
-    VISION_PROVIDER: str = "ollama"
+    VISION_PROVIDER: str = "nvidia"
     NVIDIA_API_KEY: str = ""
+    NVIDIA_VISION_MODEL: str = "google/gemma-4-31b-it"
     
     # Telegram
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_ALLOWED_CHAT_IDS: str = ""
+    OSDA_BOT_SERVICE_KEY: str = ""
     
     # App
     APP_SECRET_KEY: str = "changeme"

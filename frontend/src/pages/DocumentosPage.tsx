@@ -14,6 +14,17 @@ import { LoadingSpinner } from '../components/LoadingSpinner'
 import { EmptyState } from '../components/EmptyState'
 import { exportarDocumentosExcel } from '../utils/exportExcel'
 
+// Helper para formatear fechas ISO a DD/MM/YYYY
+function formatDate(isoString: string | undefined): string {
+  if (!isoString) return '-'
+  try {
+    const [y, m, d] = isoString.split('-').map(Number)
+    return format(new Date(y, m - 1, d), 'dd/MM/yyyy', { locale: es })
+  } catch {
+    return isoString
+  }
+}
+
 const ESTADO_COLORES: Record<string, string> = {
   RECIBIDO: 'badge-info',
   EN_TRAMITE: 'badge-warning',
@@ -42,8 +53,7 @@ export function DocumentosPage() {
   const [estadoFiltro, setEstadoFiltro] = useState('')
   const [tipoFiltro, setTipoFiltro] = useState('')
   
-  // Selector de oficina solo para ADMIN
-  const [oficinaFiltro, setOficinaFiltro] = useState('')
+  // Filtros de oficina origen y destino
   const [oficinaOrigenFiltro, setOficinaOrigenFiltro] = useState('')
   const [oficinaDestinoFiltro, setOficinaDestinoFiltro] = useState('')
   const [fechaDesde, setFechaDesde] = useState('')
@@ -100,7 +110,7 @@ export function DocumentosPage() {
   })
 
   const { data, isLoading, isFetching, error } = useQuery({
-    queryKey: ['documentos', page, pageSize, debouncedSearch, estadoFiltro, tipoFiltro, oficinaOrigenFiltro, oficinaDestinoFiltro, fechaDesde, fechaHasta, oficinaFiltro],
+    queryKey: ['documentos', page, pageSize, debouncedSearch, estadoFiltro, tipoFiltro, oficinaOrigenFiltro, oficinaDestinoFiltro, fechaDesde, fechaHasta],
     queryFn: async () => {
       const params = new URLSearchParams()
       params.append('limit', pageSize.toString())
@@ -109,13 +119,9 @@ export function DocumentosPage() {
       if (estadoFiltro) params.append('estado', estadoFiltro)
       if (tipoFiltro) params.append('tipo_documento', tipoFiltro)
       
-      // Para ADMIN: usar oficinaFiltro (selector), para SECRETARIO: usar filtros manuales
-      if (isAdmin && oficinaFiltro) {
-        params.append('oficina_origen', oficinaFiltro)
-      } else {
-        if (oficinaOrigenFiltro) params.append('oficina_origen', oficinaOrigenFiltro)
-        if (oficinaDestinoFiltro) params.append('oficina_destino', oficinaDestinoFiltro)
-      }
+      // Filtros de oficina origen y destino (para todos los roles)
+      if (oficinaOrigenFiltro) params.append('oficina_origen_sigla', oficinaOrigenFiltro)
+      if (oficinaDestinoFiltro) params.append('oficina_destino_sigla', oficinaDestinoFiltro)
       
       if (fechaDesde) params.append('fecha_desde', fechaDesde)
       if (fechaHasta) params.append('fecha_hasta', fechaHasta)
@@ -126,7 +132,8 @@ export function DocumentosPage() {
         totalCount: parseInt(resp.headers?.['x-total-count'] || '0', 10)
       }
     },
-    placeholderData: (previousData) => previousData,
+    // No usar placeholderData para evitar mostrar datos viejos al cambiar filtros
+    // En su lugar, usamos isFetching para mostrar skeleton loader
   })
 
   const deleteMutation = useMutation({
@@ -135,6 +142,9 @@ export function DocumentosPage() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['documentos'] })
+    },
+    onError: (error: any) => {
+      alert(`No se pudo eliminar: ${error?.response?.data?.detail || error?.message || 'Error desconocido'}`)
     },
   })
 
@@ -184,7 +194,7 @@ export function DocumentosPage() {
   })
 
   const handleDelete = async (id: string) => {
-    if (confirm('¿Está seguro de archivar este documento?')) {
+    if (confirm('¿Eliminar este documento? Dejará de aparecer en el panel y en Telegram.')) {
       await deleteMutation.mutateAsync(id)
     }
   }
@@ -201,13 +211,9 @@ export function DocumentosPage() {
         if (estadoFiltro) params.append('estado', estadoFiltro)
         if (tipoFiltro) params.append('tipo_documento', tipoFiltro)
         
-        // Para ADMIN: usar oficinaFiltro (selector), para SECRETARIO: usar filtros manuales
-        if (isAdmin && oficinaFiltro) {
-          params.append('oficina_origen', oficinaFiltro)
-        } else {
-          if (oficinaOrigenFiltro) params.append('oficina_origen', oficinaOrigenFiltro)
-          if (oficinaDestinoFiltro) params.append('oficina_destino', oficinaDestinoFiltro)
-        }
+        // Filtros de oficina origen y destino (para todos los roles)
+        if (oficinaOrigenFiltro) params.append('oficina_origen_sigla', oficinaOrigenFiltro)
+        if (oficinaDestinoFiltro) params.append('oficina_destino_sigla', oficinaDestinoFiltro)
         
         if (fechaDesde) params.append('fecha_desde', fechaDesde)
         if (fechaHasta) params.append('fecha_hasta', fechaHasta)
@@ -397,52 +403,33 @@ export function DocumentosPage() {
                   ))}
                 </select>
               </div>
-              {/* Selector de oficina solo para ADMIN */}
-              {isAdmin && (
-                <div>
-                  <label className="label">Oficina (Filtro General)</label>
-                  <select
-                    value={oficinaFiltro}
-                    onChange={(e) => setOficinaFiltro(e.target.value)}
-                    className="input"
-                  >
-                    <option value="">Todas</option>
-                    {oficinas.map(o => (
-                      <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
-                    ))}
-                  </select>
-                </div>
-              )}
-              {!isAdmin && (
-                <>
-                  <div>
-                    <label className="label">Oficina Origen</label>
-                    <select
-                      value={oficinaOrigenFiltro}
-                      onChange={(e) => setOficinaOrigenFiltro(e.target.value)}
-                      className="input"
-                    >
-                      <option value="">Todas</option>
-                      {oficinas.map(o => (
-                        <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="label">Oficina Destino</label>
-                    <select
-                      value={oficinaDestinoFiltro}
-                      onChange={(e) => setOficinaDestinoFiltro(e.target.value)}
-                      className="input"
-                    >
-                      <option value="">Todas</option>
-                      {oficinas.map(o => (
-                        <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
-                      ))}
-                    </select>
-                  </div>
-                </>
-              )}
+              {/* Filtros de oficina origen y destino para todos los roles */}
+              <div>
+                <label className="label">Oficina Origen</label>
+                <select
+                  value={oficinaOrigenFiltro}
+                  onChange={(e) => setOficinaOrigenFiltro(e.target.value)}
+                  className="input"
+                >
+                  <option value="">Todas</option>
+                  {oficinas.map(o => (
+                    <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="label">Oficina Destino</label>
+                <select
+                  value={oficinaDestinoFiltro}
+                  onChange={(e) => setOficinaDestinoFiltro(e.target.value)}
+                  className="input"
+                >
+                  <option value="">Todas</option>
+                  {oficinas.map(o => (
+                    <option key={o.sigla} value={o.sigla}>{o.sigla} - {o.nombre}</option>
+                  ))}
+                </select>
+              </div>
               <div className="sm:col-span-2 lg:col-span-2 flex gap-4">
                 <div className="flex-1">
                   <label className="label">Fecha desde</label>
@@ -479,6 +466,7 @@ export function DocumentosPage() {
                 <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Oficinas</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Fechas</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Asunto</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Estado</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-muted uppercase">Acciones</th>
               </tr>
             </thead>
@@ -498,11 +486,16 @@ export function DocumentosPage() {
                     </div>
                   </td>
                   <td className="px-4 py-3 text-sm text-muted">
-                    <div>Doc: {doc.fecha_documento ? (() => { const [y,m,d] = doc.fecha_documento.split('-').map(Number); return format(new Date(y, m-1, d), 'dd/MM/yyyy', { locale: es }) })() : '-'}</div>
-                    <div>Rec: {doc.fecha_recepcion ? (() => { const [y,m,d] = doc.fecha_recepcion.split('-').map(Number); return format(new Date(y, m-1, d), 'dd/MM/yyyy', { locale: es }) })() : '-'}</div>
+                    <div>Doc: {formatDate(doc.fecha_documento)}</div>
+                    <div>Rec: {formatDate(doc.fecha_recepcion)}</div>
                   </td>
                   <td className="px-4 py-3 text-sm text-muted max-w-md truncate">
                     {doc.asunto || '-'}
+                  </td>
+                  <td className="px-4 py-3">
+                    <span className={`badge ${ESTADO_COLORES[doc.estado] || 'badge-gray'}`}>
+                      {doc.estado}
+                    </span>
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center gap-1">
@@ -521,10 +514,15 @@ export function DocumentosPage() {
                         <Edit className="w-4 h-4" />
                       </button>
                       <button
-                        onClick={() => handleDelete(doc.id)}
+                        type="button"
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          handleDelete(doc.id)
+                        }}
                         disabled={deleteMutation.isPending}
                         className="p-2 rounded-lg btn-ghost text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300"
-                        aria-label="Archivar"
+                        aria-label="Eliminar"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>

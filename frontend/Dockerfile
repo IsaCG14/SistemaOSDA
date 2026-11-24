@@ -2,9 +2,9 @@
 # Build stage
 FROM node:20-alpine as builder
 
+ARG CACHE_BUST=1
 WORKDIR /app
 
-# Configure npm proxy
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 ARG NO_PROXY

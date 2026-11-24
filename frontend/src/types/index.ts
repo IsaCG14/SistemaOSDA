@@ -2,17 +2,22 @@ export interface Documento {
   id: string
   correlativo: string
   tipo_doc_codigo: string
-  tipo_documento: string  // alias for compatibility
+  /** @deprecated Use `tipo_doc_codigo` instead */
+  tipo_documento: string
   oficina_origen_sigla: string
-  oficina_origen: string  // alias for compatibility
+  /** @deprecated Use `oficina_origen_sigla` instead */
+  oficina_origen: string
   oficina_destino_sigla: string
-  oficina_destino: string  // alias for compatibility
+  /** @deprecated Use `oficina_destino_sigla` instead */
+  oficina_destino: string
   fecha_documento: string
   fecha_recepcion?: string
   remitente_id?: string
-  remitente?: string  // alias for compatibility
+  /** @deprecated Use `remitente_id` instead */
+  remitente?: string
   destinatario_id?: string
-  destinatario?: string  // alias for compatibility
+  /** @deprecated Use `destinatario_id` instead */
+  destinatario?: string
   asunto?: string
   folios?: number
   anexos?: string[]
@@ -23,9 +28,11 @@ export interface Documento {
   confirmado_por?: string
   confirmado_en?: string
   creado_en: string
-  created_at: string  // alias for compatibility
+  /** @deprecated Use `creado_en` instead */
+  created_at: string
   actualizado_en?: string
-  updated_at?: string  // alias for compatibility
+  /** @deprecated Use `actualizado_en` instead */
+  updated_at?: string
 }
 
 export interface Oficina {
@@ -40,6 +47,10 @@ export interface Persona {
   cargo?: string
   oficina_sigla?: string
   telegram_user_id?: number
+  username?: string
+  email?: string
+  activa?: boolean
+  role?: 'ADMIN' | 'SECRETARIO'
 }
 
 export interface TipoDocumento {

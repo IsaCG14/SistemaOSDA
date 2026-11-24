@@ -12,8 +12,8 @@ import { ConfiguracionPage } from './pages/ConfiguracionPage'
 import { useAuth } from './hooks/useAuth'
 import { LoadingSpinner } from './components/LoadingSpinner'
 
-function PrivateRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, loading } = useAuth()
+function PrivateRoute({ children, adminOnly = false }: { children: React.ReactNode, adminOnly?: boolean }) {
+  const { user, loading } = useAuth()
   
   if (loading) {
     return (
@@ -23,7 +23,15 @@ function PrivateRoute({ children }: { children: React.ReactNode }) {
     )
   }
   
-  return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />
+  if (!user) {
+    return <Navigate to="/login" replace />
+  }
+  
+  if (adminOnly && user.role !== 'ADMIN') {
+    return <Navigate to="/dashboard" replace />
+  }
+  
+  return <>{children}</>
 }
 
 export function App() {
@@ -37,7 +45,8 @@ export function App() {
         <Route path="/documentos/:id" element={<DocumentoDetailPage />} />
         <Route path="/oficinas" element={<OficinasPage />} />
         <Route path="/tipos-documento" element={<TiposDocumentoPage />} />
-        <Route path="/personas" element={<PersonasPage />} />
+        <Route path="/usuarios" element={<PrivateRoute adminOnly><PersonasPage /></PrivateRoute>} />
+        <Route path="/personas" element={<Navigate to="/usuarios" replace />} />
         <Route path="/consultas" element={<ConsultasPage />} />
         <Route path="/configuracion" element={<ConfiguracionPage />} />
       </Route>

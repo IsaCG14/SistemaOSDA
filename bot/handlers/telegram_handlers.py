@@ -14,8 +14,7 @@ from bot.core.config import settings, get_settings_instance
 
 logger = logging.getLogger(__name__)
 
-# Estados de conversación para corrección
-CORRECTION_FIELD = "correction_field"
+CORRECTION_FIELD_KEY = "correction_field"
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -112,10 +111,10 @@ async def pendientes_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     # Import here to ensure PYTHONPATH is set
-    from app.services.graphify_client import graphify_client
+    from bot.core.backend_client import consultar_documentos
     
     try:
-        docs = await graphify_client.get_pending_documents()
+        docs = await consultar_documentos(limit=1000)
         
         if docs:
             texto = f"⏳ **Documentos pendientes ({len(docs)}):**\n\n"
@@ -149,13 +148,20 @@ async def correlativo_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     oficina, tipo = args[0].upper(), args[1].upper()
-    
-    # Import here to ensure PYTHONPATH is set
-    from app.services.graphify_client import graphify_client
-    
+
     try:
-        result = await graphify_client.get_last_correlativo(oficina, tipo)
-        
+        from bot.core.backend_client import consultar_documentos
+
+        docs = await consultar_documentos(
+            oficina_origen=oficina,
+            tipo_documento=tipo,
+            limit=1,
+        )
+        result = (
+            {"correlativo": docs[0].get("correlativo"), "fecha": docs[0].get("fecha_documento")}
+            if docs else None
+        )
+
         if result and result.get("correlativo"):
             await update.message.reply_text(
                 f"🔢 **Último correlativo:**\n"
@@ -451,11 +457,12 @@ async def resumen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         import httpx
+        from bot.core.backend_client import backend_headers
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
-            r = await client.get("http://osda-backend:8000/api/documentos/metricas")
+            r = await client.get("http://osda-backend:8000/api/documentos/metricas", headers=backend_headers())
             r.raise_for_status()
             m = r.json()
-            r2 = await client.get("http://osda-backend:8000/api/documentos", params={"limit": 1})
+            r2 = await client.get("http://osda-backend:8000/api/documentos", params={"limit": 1}, headers=backend_headers())
             r2.raise_for_status()
             ultimo = (r2.json() or [{}])[0]
     except Exception as e:
@@ -524,7 +531,13 @@ async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Detectar intención de "huecos/faltantes en correlativos"
         gap_keywords = ["faltan", "faltante", "huecos", "hueco", "pendientes de registrar", "por registrar", "faltan por"]
-        is_gaps = any(k in pregunta for k in gap_keywords) and ("correlativo" in pregunta or "correlativos" in pregunta or "numer" in pregunta or "numero" in pregunta or "secuencia" in pregunta or tipo in ["MEMO", "OFICIO", "CIRCULAR", "INFORME", "NOTA", "ACTA", "RESOLUCION", "SOLICITUD", "RECIBO", "OTRO"])
+        # Detectar si hay palabras de tipo de documento en la pregunta (independiente de la variable `tipo`)
+        tipo_en_pregunta = any(t.lower() in pregunta for t in TIPOS_VALIDOS)
+        is_gaps = any(k in pregunta for k in gap_keywords) and (
+            "correlativo" in pregunta or "correlativos" in pregunta or 
+            "numer" in pregunta or "numero" in pregunta or "secuencia" in pregunta or 
+            tipo_en_pregunta
+        )
         
         # Si no hay tipo específico pero sí palabras de huecos, intentar detectar tipo
         if is_gaps and not tipo:
@@ -543,13 +556,15 @@ async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tipo = "NOTA"
             search_subtipo = "entrega"
 
-        # Detectar intención de conteo (con normalización Unicode)
+        # Detectar intención de conteo (con normalización Unicode y word boundaries)
         import unicodedata
+        import re
         count_keywords = ["cuantos", "cuántos", "cuantas", "cuántas", "total", "numero", "número"]
         # Normalizar a NFC para comparar correctamente acentos
         pregunta_nfc = unicodedata.normalize("NFC", pregunta)
-        count_keywords_nfc = [unicodedata.normalize("NFC", k) for k in count_keywords]
-        is_count = any(k in pregunta_nfc for k in count_keywords_nfc)
+        # Usar word boundaries para evitar falsos positivos (ej: "algunos" contiene "cuantos")
+        count_pattern = r"\b(" + "|".join(re.escape(unicodedata.normalize("NFC", k)) for k in count_keywords) + r")\b"
+        is_count = bool(re.search(count_pattern, pregunta_nfc))
 
         # Detectar filtros temporales
         fecha_desde = None
@@ -563,11 +578,22 @@ async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fecha_hasta = fin_mes
             mes_actual = True
 
-        # Obtener lista de oficinas del backend para detectar siglas en la pregunta
-        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
-            resp = await client.get("http://osda-backend:8000/api/oficinas")
-            resp.raise_for_status()
-            oficinas = resp.json()
+        # Cache para oficinas (TTL 5 minutos)
+        _oficinas_cache = getattr(consulta_command, "_oficinas_cache", None)
+        _oficinas_cache_time = getattr(consulta_command, "_oficinas_cache_time", 0)
+        import time
+        now = time.time()
+        
+        if _oficinas_cache is None or (now - _oficinas_cache_time) > 300:  # 5 min TTL
+            from ..core.backend_client import backend_headers
+            async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+                resp = await client.get("http://osda-backend:8000/api/oficinas", headers=backend_headers())
+                resp.raise_for_status()
+                oficinas = resp.json()
+            consulta_command._oficinas_cache = oficinas
+            consulta_command._oficinas_cache_time = now
+        else:
+            oficinas = _oficinas_cache
         oficinas_siglas = [o["sigla"].lower() for o in oficinas if o.get("activa")]
 
         # Mapeo de nombres comunes/alias a siglas para consultas en lenguaje natural
@@ -602,6 +628,7 @@ async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "registrado", "registrados", "archivado", "archivados",
             "recibido", "respondido", "tramite", "trámite",
             "este mes", "mes actual", "ultimo", "último", "ultima", "última",
+            # Preposiciones removidas para evitar falsos positivos: "para", "a ", "de ", "desde ", "en "
         ]
         DOCUMENT_KEYWORDS.extend(oficinas_siglas)
         DOCUMENT_KEYWORDS.extend(OFICINA_ALIASES.keys())
@@ -765,7 +792,7 @@ async def consulta_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Para consultas de conteo: usar return_count=True para obtener total del backend
         if is_count:
-            docs, total = await consultar_documentos(**filtros, limit=1000, return_count=True)
+            docs, total = await consultar_documentos(**filtros, limit=1, return_count=True)
 
             respuesta = f"📊 **Consulta: {' '.join(args)}**\n\n"
             respuesta += f"📊 **Total: {total}**"
@@ -995,7 +1022,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         doc_key = hashlib.md5(f"{file_id}_{update.effective_user.id}".encode()).hexdigest()[:16]
         context.bot_data[doc_key] = {
             "file_id": file_id,
-            "file_path": temp_path,  # Ya no existe, pero guardamos info
+            "file_path": None,  # Archivo temporal ya eliminado
             "mime_type": mime_type,
             "ocr_data": result["data"],
             "chat_id": update.effective_chat.id,
@@ -1127,11 +1154,11 @@ async def approve_document(query, pending: dict, doc_key: str, context: ContextT
         headers = {
             "Content-Type": "application/json",
             "apikey": settings.SUPABASE_ANON_KEY,
-            "Authorization": f"Bearer {settings.SUPABASE_ANON_KEY}",
+            "X-OSDA-Service-Key": settings.OSDA_BOT_SERVICE_KEY,
             "Prefer": "return=representation"
         }
         
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
             result = await client.post(
                 "http://osda-backend:8000/api/documentos",
                 json=doc_data,
@@ -1250,7 +1277,7 @@ async def reject_document(query, pending: dict, doc_key: str, context: ContextTy
 async def edit_field(query, pending: dict, doc_key: str, field: str, context: ContextTypes.DEFAULT_TYPE):
     """Editar un campo específico."""
     # Guardar campo en edición
-    context.user_data[CORRECTION_FIELD] = field
+    context.user_data[CORRECTION_FIELD_KEY] = field
     
     field_labels = {
         "correlativo": "🔢 Correlativo (ej: OTIC-MEMO-2026-0001)",
@@ -1280,7 +1307,7 @@ async def handle_correction_text(update: Update, context: ContextTypes.DEFAULT_T
     if not context.user_data.get("awaiting_correction"):
         return
     
-    field = context.user_data.get(CORRECTION_FIELD)
+    field = context.user_data.get(CORRECTION_FIELD_KEY)
     new_value = update.message.text.strip()
     
     if not field:
@@ -1314,11 +1341,14 @@ async def handle_correction_text(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("❌ No se encontró documento en edición")
     
     context.user_data["awaiting_correction"] = False
-    context.user_data.pop(CORRECTION_FIELD, None)
+    context.user_data.pop(CORRECTION_FIELD_KEY, None)
 
 
 def validate_field(field: str, value: str):
     """Validar valor según campo."""
+    # Cargar listas válidas (import local para evitar dependencias circulares)
+    from ..core.backend_client import TIPOS_VALIDOS
+    
     if field in ["correlativo"]:
         # Formatos reales usados por la oficina (secuencia de 3+ digitos al final):
         #   OTIC-2026-003          -> SIGLA-AÑO-SECUENCIA
@@ -1344,6 +1374,28 @@ def validate_field(field: str, value: str):
         except ValueError:
             return None
     
+    elif field in ["tipo_documento"]:
+        # Validar contra tipos conocidos
+        v = value.strip().upper()
+        if v in TIPOS_VALIDOS:
+            return v
+        return None
+    
+    elif field in ["oficina_origen", "oficina_destino"]:
+        # Validar contra oficinas conocidas (cargar desde backend si disponible)
+        # Por ahora, validar formato básico: 2-6 letras mayúsculas
+        v = value.strip().upper()
+        if re.match(r'^[A-Z]{2,6}$', v):
+            return v
+        return None
+    
+    elif field in ["remitente", "destinatario", "asunto"]:
+        # Texto libre pero no vacío
+        v = value.strip()
+        if v:
+            return v
+        return None
+    
     # Para el resto, devolver el valor limpio
     return value.strip()
 
@@ -1352,7 +1404,7 @@ async def finish_correction(query, pending: dict, doc_key: str, context: Context
     """Terminar corrección y volver a preview."""
     # Eliminar flag de corrección
     context.user_data.pop("awaiting_correction", None)
-    context.user_data.pop(CORRECTION_FIELD, None)
+    context.user_data.pop(CORRECTION_FIELD_KEY, None)
     
     # Mostrar preview actualizado
     from bot.handlers.telegram_handlers import format_ocr_preview, get_validation_keyboard
@@ -1370,7 +1422,7 @@ async def cancel_correction(query, pending: dict, doc_key: str, context: Context
     """Cancelar corrección y volver a preview."""
     # Eliminar flag de corrección
     context.user_data.pop("awaiting_correction", None)
-    context.user_data.pop(CORRECTION_FIELD, None)
+    context.user_data.pop(CORRECTION_FIELD_KEY, None)
     
     # Mostrar preview actualizado
     from bot.handlers.telegram_handlers import format_ocr_preview, get_validation_keyboard
@@ -1415,21 +1467,26 @@ def get_validation_keyboard(doc_key: str):
 
 
 def is_authorized(chat_id, user_id, thread_id):
-    """Verificar autorización: solo permitir en el topic/thread configurado."""
+    """Permitir el grupo configurado; restringir otros topics si se configura uno."""
     settings = get_settings_instance()
-    
-    # Si no hay topic ID configurado, permitir todos (compatibilidad)
+
+    allowed_chats = {
+        value.strip()
+        for value in (settings.TELEGRAM_ALLOWED_CHAT_IDS or "").split(",")
+        if value.strip()
+    }
+    if allowed_chats and str(chat_id) not in allowed_chats:
+        return False
+
+    # El chat principal (thread_id=None) también pertenece al grupo autorizado.
+    if thread_id is None:
+        return True
+
     if not settings.TELEGRAM_DOCUMENT_TOPIC_ID:
         return True
-    
-    # Si no hay thread_id en el mensaje, no autorizar (es un grupo con topics)
-    if thread_id is None:
-        return False
-    
-    # Verificar que el thread_id coincida con el configurado
+
     try:
-        allowed_thread_id = int(settings.TELEGRAM_DOCUMENT_TOPIC_ID)
-        return thread_id == allowed_thread_id
+        return thread_id == int(settings.TELEGRAM_DOCUMENT_TOPIC_ID)
     except (ValueError, TypeError):
-        # Si no es un entero válido, permitir por seguridad
-        return True
+        logger.error("TELEGRAM_DOCUMENT_TOPIC_ID debe ser numérico")
+        return False

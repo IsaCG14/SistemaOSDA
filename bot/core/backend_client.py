@@ -6,6 +6,7 @@ soporta: search (sin acentos), tipo_documento, estado, oficinas y
 rangos de fecha. El grafo Neo4j queda solo para trazabilidad (/traza).
 """
 import calendar
+import os
 import httpx
 import logging
 import re
@@ -14,6 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 BASE_URL = "http://osda-backend:8000/api/documentos"
+
+
+def backend_headers() -> Dict[str, str]:
+    """Credencial de servicio; nunca confundirla con la anon key de Supabase."""
+    return {"X-OSDA-Service-Key": os.getenv("OSDA_BOT_SERVICE_KEY", "")}
 
 TIPOS_VALIDOS = [
     "MEMO", "OFICIO", "CIRCULAR", "INFORME", "NOTA",
@@ -53,16 +59,16 @@ async def consultar_documentos(
     if estado:
         params["estado"] = estado
     if oficina_origen:
-        params["oficina_origen"] = oficina_origen
+        params["oficina_origen_sigla"] = oficina_origen
     if oficina_destino:
-        params["oficina_destino"] = oficina_destino
+        params["oficina_destino_sigla"] = oficina_destino
     if fecha_desde:
         params["fecha_desde"] = fecha_desde
     if fecha_hasta:
         params["fecha_hasta"] = fecha_hasta
     try:
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
-            resp = await client.get(BASE_URL, params=params)
+            resp = await client.get(BASE_URL, params=params, headers=backend_headers())
             resp.raise_for_status()
             docs = resp.json()
             if return_count:

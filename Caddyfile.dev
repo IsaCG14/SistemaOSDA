@@ -10,23 +10,38 @@
 }
 
 # Frontend + API + Graphify en HTTP - Acepta múltiples hosts
-http://corpocentro.osda.net, http://localhost, http://127.0.0.1, http://192.168.251.203 {
-    # Auth (Supabase/Kong) - DEBE ir ANTES que /api* general
-    # Quitar prefijo /api antes de enviar a Kong
-    handle /api/auth* {
-        uri strip_prefix /api
-        reverse_proxy supabase-kong:8000
+http://corpocentro.osda.net:8880, http://localhost:8880, http://127.0.0.1:8880, http://192.168.251.203:8880, http://100.81.239.93:8880, http://*.tailnet.ts.net:8880 {
+    # DELETE /api/personas/{uuid} -> Backend (with role-based access control)
+    # DEBE IR PRIMERO para que se evalúe antes que /api/personas*
+    @deletePersona {
+        method DELETE
+        path_regexp ^/api/personas/[0-9a-f-]{36}$
+    }
+    handle @deletePersona {
+        reverse_proxy backend:8000 {
+            transport http {
+                versions h1
+            }
+        }
     }
 
-    # Personas CRUD (PostgREST via Kong) - necesita /rest/v1/
+    # Personas CRUD (via Backend with role-based access control)
+    # DEBE ir ANTES que /api* general
     handle /api/personas* {
-        uri replace /api/personas /rest/v1/personas
-        reverse_proxy supabase-kong:8000
+        reverse_proxy backend:8000 {
+            transport http {
+                versions h1
+            }
+        }
     }
 
     # Configuración general - DEBE ir ANTES que /api* general
     handle /api/configuracion* {
-        reverse_proxy backend:8000
+        reverse_proxy backend:8000 {
+            transport http {
+                versions h1
+            }
+        }
     }
 
     # Frontend (React) - Producción (nginx sirviendo archivos estáticos)
@@ -47,19 +62,32 @@ http://corpocentro.osda.net, http://localhost, http://127.0.0.1, http://192.168.
         reverse_proxy osda-frontend:80
     }
 
-    # Frontend (React) - Catch-all para SPA routing
-    handle {
-        reverse_proxy osda-frontend:80 {
-            header_up Host {host}
-            header_up X-Real-IP {remote}
-            header_up X-Forwarded-For {remote}
-            header_up X-Forwarded-Proto {scheme}
+    # Health check endpoint - DEBE ir ANTES del catch-all
+    handle /health {
+        reverse_proxy backend:8000 {
+            transport http {
+                versions h1
+            }
+        }
+    }
+
+    # Auth (Supabase/Kong) via /api prefix - DEBE IR ANTES que /api* general
+    handle /api/auth* {
+        uri strip_prefix /api
+        reverse_proxy supabase-kong:8000 {
+            transport http {
+                versions h1
+            }
         }
     }
 
     # Backend API (FastAPI) - excluye /api/auth y /api/personas
     handle /api* {
-        reverse_proxy backend:8000
+        reverse_proxy backend:8000 {
+            transport http {
+                versions h1
+            }
+        }
     }
 
     # Graphify
@@ -69,7 +97,40 @@ http://corpocentro.osda.net, http://localhost, http://127.0.0.1, http://192.168.
 
     # Webhook Telegram (para compatibilidad, aunque usemos polling)
     handle /webhook/telegram* {
-        reverse_proxy backend:8000
+        reverse_proxy backend:8000 {
+            transport http {
+                versions h1
+            }
+        }
+    }
+
+    # Supabase Auth (GoTrue via Kong) - direct path
+    handle /auth* {
+        reverse_proxy supabase-kong:8000 {
+            transport http {
+                versions h1
+            }
+        }
+    }
+
+    # PostgREST via Kong - direct path
+    handle /rest* {
+        reverse_proxy supabase-kong:8000 {
+            transport http {
+                versions h1
+            }
+        }
+    }
+
+    # Frontend (React) - Catch-all para SPA routing
+    # DEBE IR AL FINAL, después de todos los handles específicos
+    handle {
+        reverse_proxy osda-frontend:80 {
+            header_up Host {host}
+            header_up X-Real-IP {remote}
+            header_up X-Forwarded-For {remote}
+            header_up X-Forwarded-Proto {scheme}
+        }
     }
 }
 

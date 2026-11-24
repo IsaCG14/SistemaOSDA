@@ -75,7 +75,7 @@ async def create_schema():
         for query in queries:
             try:
                 session.run(query)
-                logger.info(f"Schema: {query[:60]}...")
+                logger.debug(f"Schema applied: {query[:60]}...")
             except Exception as e:
                 logger.warning(f"Schema query warning: {e}")
 
@@ -147,16 +147,29 @@ class TraceResult(BaseModel):
 # HELPERS
 # ─────────────────────────────────────────────────────────────────
 
-def to_plain(obj):
-    """Convierte tipos nativos de Neo4j (Date/DateTime/etc) a tipos JSON-safe."""
+def to_plain(obj, seen=None):
+    """Convierte tipos nativos de Neo4j (Date/DateTime/etc) a tipos JSON-safe.
+    Maneja referencias circulares usando un set de objetos ya visitados."""
     from neo4j.time import Date, DateTime
-    if isinstance(obj, (Date, DateTime)):
-        return str(obj)
-    if isinstance(obj, dict):
-        return {k: to_plain(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [to_plain(v) for v in obj]
-    return obj
+    if seen is None:
+        seen = set()
+    
+    # Detectar ciclos usando id() del objeto
+    obj_id = id(obj)
+    if obj_id in seen:
+        return "[Circular Reference]"
+    seen.add(obj_id)
+    
+    try:
+        if isinstance(obj, (Date, DateTime)):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {k: to_plain(v, seen) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [to_plain(v, seen) for v in obj]
+        return obj
+    finally:
+        seen.discard(obj_id)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -215,6 +228,20 @@ async def create_documento(doc: DocumentoCreate, drv: Driver = Depends(get_drive
         if record:
             return DocumentoResponse(**to_plain(dict(record["d"])))
         raise HTTPException(status_code=500, detail="Error creando documento")
+
+
+@app.delete("/documentos/{doc_id}", status_code=200)
+async def delete_documento(doc_id: str, drv: Driver = Depends(get_driver)):
+    """Eliminar de la réplica un documento borrado de PostgreSQL."""
+    with drv.session() as session:
+        result = session.run(
+            "MATCH (d:Documento {id: $id}) DETACH DELETE d RETURN count(d) AS deleted",
+            id=doc_id,
+        )
+        deleted = result.single()["deleted"]
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Documento no encontrado")
+    return {"message": "Documento eliminado de Graphify", "id": doc_id}
 
 
 @app.get("/trace/{correlativo}", response_model=TraceResult)
@@ -309,15 +336,21 @@ async def get_ultimo_correlativo(
 @app.get("/consultas/por-oficina")
 async def get_por_oficina(
     oficina: str = Query(...),
+    tipo_documento: Optional[str] = None,
     mes: Optional[int] = None,
     anio: Optional[int] = None,
+    limit: int = 100,
     drv: Driver = Depends(get_driver)
 ):
     # OJO con la precedencia: el OR de oficinas debe ir entre parentesis,
     # si no AND ate el filtro de fecha solo a la rama "destino" y los
     # documentos con ORIGEN en la oficina ignoran el mes/anio.
     where = "(d.oficina_origen_sigla = $oficina OR d.oficina_destino_sigla = $oficina)"
-    params = {"oficina": oficina}
+    params = {"oficina": oficina, "limit": limit}
+
+    if tipo_documento:
+        where += " AND d.tipo_documento = $tipo_documento"
+        params["tipo_documento"] = tipo_documento
 
     if mes and anio:
         where += " AND d.fecha_documento >= date($inicio) AND d.fecha_documento <= date($fin)"
@@ -325,13 +358,13 @@ async def get_por_oficina(
         params["inicio"] = f"{anio}-{mes:02d}-01"
         last_day = calendar.monthrange(anio, mes)[1]
         params["fin"] = f"{anio}-{mes:02d}-{last_day}"
-    
+
     query = f"""
     MATCH (d:Documento)
     WHERE {where}
-    RETURN d ORDER BY d.fecha_documento DESC LIMIT 100
+    RETURN d ORDER BY d.fecha_documento DESC LIMIT $limit
     """
-    
+
     with drv.session() as session:
         result = session.run(query, **params)
         return to_plain([dict(record["d"]) for record in result])

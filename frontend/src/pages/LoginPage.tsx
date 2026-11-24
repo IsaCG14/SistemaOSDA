@@ -7,7 +7,7 @@ import { AlertCircle, Loader2, Eye, EyeOff } from 'lucide-react'
 export function LoginPage() {
   const { login } = useAuth()
   const navigate = useNavigate()
-  const [email, setEmail] = useState('')
+  const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
@@ -25,7 +25,7 @@ export function LoginPage() {
     setLoading(true)
     
     try {
-      await login(email, password)
+      await login(identifier, password)
       navigate('/dashboard')
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Credenciales inválidas')
@@ -63,16 +63,16 @@ export function LoginPage() {
         
           <form onSubmit={handleSubmit} className="space-y-5">
             <div>
-              <label htmlFor="email" className="label">Correo electrónico</label>
+              <label htmlFor="identifier" className="label">Usuario o correo electrónico</label>
               <input
-                id="email"
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                id="identifier"
+                type="text"
+                value={identifier}
+                onChange={(e) => setIdentifier(e.target.value)}
                 className="input bg-gray-800 border-gray-700 text-white placeholder-gray-500 focus:border-blue-500 focus:ring-blue-500"
-                placeholder="usuario@ejemplo.gob.ve"
+                placeholder="usuario o usuario@ejemplo.gob.ve"
                 required
-                autoComplete="email"
+                autoComplete="username"
                 disabled={loading}
               />
             </div>
